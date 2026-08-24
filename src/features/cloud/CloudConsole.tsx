@@ -4,29 +4,30 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Activity,
   Clock3,
   Code2,
   Copy,
-  Eye,
-  EyeOff,
   FileKey2,
-  KeyRound,
   LoaderCircle,
   LockKeyhole,
   Network,
   Play,
-  RotateCcw,
   Search,
   Send,
   ShieldCheck,
   SlidersHorizontal,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { CredentialBar } from "../../components/CredentialBar";
 import { PreferenceControls } from "../../components/PreferenceControls";
 import { WorkspaceSwitch, type WorkspaceMode } from "../../components/WorkspaceSwitch";
 import { api, normalizeError } from "../../lib/ipc";
+import { describeCredentialMode, useSessionCredentials } from "../../lib/sessionCredentials";
+import { patchWorkspaceMemory, readWorkspaceMemory } from "../../lib/workspaceMemory";
 import type {
   CloudProvider,
   CloudRequest,
@@ -37,7 +38,16 @@ import type {
 import { CloudResultView } from "./CloudResultView";
 import { findPreset, groupPresetsByProvider, PRESETS, PROVIDERS, presetMatchesQuery, type CloudPreset } from "./presets";
 
-type ResultTab = "body" | "headers" | "signature";
+type ResultTab = "body" | "headers" | "signature" | "history";
+
+interface CloudHistoryEntry {
+  id: string;
+  label: string;
+  method: string;
+  timestamp: Date;
+  response?: CloudResponse;
+  error?: CommandError;
+}
 
 function statusTone(status: number) {
   if (status >= 200 && status < 300) return "success";
@@ -54,13 +64,23 @@ export function CloudConsole({
   workspaceMode: WorkspaceMode;
   onWorkspaceChange: (mode: WorkspaceMode) => void;
 }) {
-  const [presetId, setPresetId] = useState(PRESETS[0].id);
-  const [form, setForm] = useState<CloudPreset>(PRESETS[0]);
-  const [expandedProviders, setExpandedProviders] = useState<Set<CloudProvider>>(() => new Set([PRESETS[0].provider]));
-  const [accessKeyId, setAccessKeyId] = useState("");
-  const [accessKeySecret, setAccessKeySecret] = useState("");
-  const [securityToken, setSecurityToken] = useState("");
-  const [showSecret, setShowSecret] = useState(false);
+  const [presetId, setPresetId] = useState(() => findPreset(readWorkspaceMemory().cloudPresetId).id);
+  const [form, setForm] = useState<CloudPreset>(() => {
+    const remembered = readWorkspaceMemory();
+    const preset = findPreset(remembered.cloudPresetId);
+    if (remembered.cloudPresetId !== preset.id) return preset;
+    return {
+      ...preset,
+      endpoint: remembered.cloudEndpoint || preset.endpoint,
+      region: remembered.cloudRegion || preset.region,
+      query: remembered.cloudQuery || preset.query,
+    };
+  });
+  const [expandedProviders, setExpandedProviders] = useState<Set<CloudProvider>>(
+    () => new Set([findPreset(readWorkspaceMemory().cloudPresetId).provider]),
+  );
+  const [history, setHistory] = useState<CloudHistoryEntry[]>([]);
+  const { credentials } = useSessionCredentials();
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:8080");
   const [allowInvalidCertificates, setAllowInvalidCertificates] = useState(false);
@@ -116,10 +136,14 @@ export function CloudConsole({
     query: form.query,
     body: form.body,
     contentType: form.contentType,
-    credentials: { accessKeyId, accessKeySecret, securityToken },
+    credentials: {
+      accessKeyId: credentials.accessKeyId,
+      accessKeySecret: credentials.accessKeySecret,
+      securityToken: credentials.securityToken,
+    },
     proxyUrl: proxyEnabled ? proxyUrl : undefined,
     allowInvalidCertificates,
-  }), [accessKeyId, accessKeySecret, allowInvalidCertificates, form, proxyEnabled, proxyUrl, securityToken]);
+  }), [allowInvalidCertificates, credentials, form, proxyEnabled, proxyUrl]);
 
   const previewSignature = useCallback(async () => {
     setError(null);
@@ -144,13 +168,28 @@ export function CloudConsole({
       setResponse(result);
       setSignature(result.signature);
       setResultTab("body");
+      setHistory((current) => [{
+        id: requestId,
+        label: `${form.product} · ${form.label}`,
+        method: form.method,
+        timestamp: new Date(),
+        response: result,
+      }, ...current].slice(0, 20));
     } catch (reason) {
-      setError(normalizeError(reason));
+      const commandError = normalizeError(reason);
+      setError(commandError);
+      setHistory((current) => [{
+        id: requestId,
+        label: `${form.product} · ${form.label}`,
+        method: form.method,
+        timestamp: new Date(),
+        error: commandError,
+      }, ...current].slice(0, 20));
     } finally {
       setRequesting(false);
       setActiveRequestId(null);
     }
-  }, [buildRequest, requesting]);
+  }, [buildRequest, form.label, form.method, form.product, requesting]);
 
   const cancelRequest = useCallback(async () => {
     if (activeRequestId) await api.cancelRequest(activeRequestId);
@@ -176,6 +215,12 @@ export function CloudConsole({
     setResponse(null);
     setSignature(null);
     setError(null);
+    patchWorkspaceMemory({
+      cloudPresetId: preset.id,
+      cloudEndpoint: preset.endpoint,
+      cloudRegion: preset.region,
+      cloudQuery: preset.query,
+    });
   };
 
   const toggleProvider = (id: CloudProvider) => {
@@ -187,7 +232,17 @@ export function CloudConsole({
   };
 
   const update = <K extends keyof CloudPreset>(key: K, value: CloudPreset[K]) => {
-    setForm((current) => ({ ...current, [key]: value }));
+    setForm((current) => {
+      const next = { ...current, [key]: value };
+      if (key === "endpoint" || key === "region" || key === "query") {
+        patchWorkspaceMemory({
+          cloudEndpoint: next.endpoint,
+          cloudRegion: next.region,
+          cloudQuery: next.query,
+        });
+      }
+      return next;
+    });
   };
 
   const copy = async (value: string, message: string) => {
@@ -282,22 +337,11 @@ export function CloudConsole({
         </header>
 
         <div className="cloud-scroll">
-          <section className="cloud-panel credentials-panel">
-            <div className="cloud-panel-heading">
-              <KeyRound size={16} />
-              <div><strong>临时凭据</strong><span>仅当前窗口内存态；支持长期 AK/SK 与 STS 临时 Token</span></div>
-              <button
-                className="button secondary"
-                onClick={() => { setAccessKeyId(""); setAccessKeySecret(""); setSecurityToken(""); }}
-                disabled={!accessKeyId && !accessKeySecret && !securityToken}
-              ><RotateCcw size={14} />清空</button>
-            </div>
-            <div className="cloud-fields credentials-fields">
-              <label><span>AccessKey ID</span><input value={accessKeyId} onChange={(event) => setAccessKeyId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
-              <label className="secret-field"><span>AccessKey Secret</span><div><input type={showSecret ? "text" : "password"} value={accessKeySecret} onChange={(event) => setAccessKeySecret(event.target.value)} autoComplete="new-password" spellCheck={false} /><button className="icon-button small" onClick={() => setShowSecret((current) => !current)} aria-label={showSecret ? "隐藏密钥" : "显示密钥"}>{showSecret ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></label>
-              <label><span>Security Token（可选）</span><input type="password" value={securityToken} onChange={(event) => setSecurityToken(event.target.value)} autoComplete="off" spellCheck={false} /></label>
-            </div>
-          </section>
+          <CredentialBar
+            title="访问凭据"
+            hint="云 API 与对象存储共用当前会话；可粘贴 AssumeRole JSON。SK 不落盘。"
+            onNotice={setNotice}
+          />
 
           <section className="cloud-panel request-panel">
             <div className="cloud-panel-heading">
@@ -319,7 +363,18 @@ export function CloudConsole({
             <div className="cloud-endpoint-line">
               <select value={form.method} onChange={(event) => update("method", event.target.value)} aria-label="请求方法"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
               <input value={form.endpoint} onChange={(event) => update("endpoint", event.target.value)} spellCheck={false} aria-label="Endpoint" />
-              {requesting ? <button className="button danger" onClick={cancelRequest}><Ban size={15} />取消</button> : <button className="button primary" onClick={() => void sendRequest()}><Send size={15} />签名并发送</button>}
+              {requesting ? (
+                <button className="button danger" onClick={cancelRequest}><Ban size={15} />取消</button>
+              ) : (
+                <button
+                  className="button primary"
+                  onClick={() => void sendRequest()}
+                  disabled={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim()}
+                  title={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim() ? "先填写 AccessKey ID 和 Secret" : undefined}
+                >
+                  <Send size={15} />签名并发送
+                </button>
+              )}
             </div>
 
             <div className="cloud-fields request-meta-fields">
@@ -352,23 +407,59 @@ export function CloudConsole({
                 <button className={resultTab === "body" ? "active" : ""} onClick={() => setResultTab("body")}><Code2 size={15} />结果</button>
                 <button className={resultTab === "headers" ? "active" : ""} onClick={() => setResultTab("headers")}><SlidersHorizontal size={15} />响应头 {response && <small>{response.headers.length}</small>}</button>
                 <button className={resultTab === "signature" ? "active" : ""} onClick={() => setResultTab("signature")}><LockKeyhole size={15} />签名诊断</button>
+                <button className={resultTab === "history" ? "active" : ""} onClick={() => setResultTab("history")}><Activity size={15} />历史 {history.length ? <small>{history.length}</small> : null}</button>
               </div>
-              {response && <div className="response-meta"><span className={`status-pill ${statusTone(response.status)}`}>{response.status} {response.statusText}</span><span><Clock3 size={13} />{response.elapsedMs} ms</span></div>}
+              {response && resultTab !== "history" && <div className="response-meta"><span className={`status-pill ${statusTone(response.status)}`}>{response.status} {response.statusText}</span><span><Clock3 size={13} />{response.elapsedMs} ms</span></div>}
             </div>
             <div className="cloud-result-content">
               {requesting ? <div className="response-empty"><LoaderCircle className="spin" size={24} /><strong>正在等待云服务响应</strong><span>按 Esc 可取消</span></div>
+                : resultTab === "history" ? history.length ? <div className="history-list">
+                  {history.map((entry) => (
+                    <button
+                      key={entry.id}
+                      className="history-row"
+                      onClick={() => {
+                        if (entry.response) {
+                          setResponse(entry.response);
+                          setSignature(entry.response.signature);
+                          setError(null);
+                          setResultTab("body");
+                        }
+                      }}
+                      disabled={!entry.response}
+                    >
+                      <span className={`method method-${entry.method.toLowerCase()}`}>{entry.method}</span>
+                      <strong>{entry.label}</strong>
+                      <time>{entry.timestamp.toLocaleTimeString()}</time>
+                      {entry.response ? (
+                        <span className={`status-text ${statusTone(entry.response.status)}`}>{entry.response.status}</span>
+                      ) : (
+                        <span className="status-text error">失败</span>
+                      )}
+                      <span className="history-duration">{entry.response ? `${entry.response.elapsedMs} ms` : entry.error?.message}</span>
+                    </button>
+                  ))}
+                  <button className="clear-history" onClick={() => setHistory([])}><Trash2 size={14} />清空历史</button>
+                </div> : <div className="response-empty"><Activity size={24} /><strong>还没有请求记录</strong><span>发送后可在这里对照本次会话的结果</span></div>
                 : resultTab === "signature" ? signature ? <div className="signature-diagnostics">
                   <div className="signature-summary"><span>{signature.algorithm}</span><span>{signature.timestamp}</span><span>{signature.signedHeaders}</span>{signature.redacted && <i>已脱敏</i>}</div>
                   {[["Canonical Request", signature.canonicalRequest], ["String to Sign", signature.stringToSign], ["Authorization", signature.authorization]].map(([label, value]) => <section key={label}><header><strong>{label}</strong><button className="icon-button small" onClick={() => void copy(value, `${label} 已复制`)}><Copy size={14} /></button></header><pre><code>{value}</code></pre></section>)}
                 </div> : <div className="response-empty"><FileKey2 size={24} /><strong>还没有签名诊断</strong><span>点击“只生成签名”不会发送网络请求</span></div>
                 : resultTab === "headers" ? response ? <div className="headers-table">{response.headers.map((header, index) => <div className="header-row" key={`${header.name}-${index}`}><span>{header.name}</span><code>{header.value}</code></div>)}</div> : <div className="response-empty"><Network size={24} /><strong>还没有响应头</strong></div>
-                : response ? <CloudResultView body={response.body} kind={form.resultKind} onCopy={copy} />
-                : <div className="response-empty"><Play size={24} /><strong>准备就绪</strong><span>先用“只生成签名”检查结果，再发送真实请求</span></div>}
+                : response ? <CloudResultView body={response.body} kind={form.resultKind} requestUrl={response.url} onCopy={copy} />
+                : <div className="response-empty"><Play size={24} /><strong>准备就绪</strong><span>填入 AK/SK 或整段 STS JSON 后发送；也可先只生成签名</span></div>}
             </div>
           </section>
         </div>
 
-        <footer className="status-bar"><span className="connected"><i />Rust Cloud Signer 就绪</span><span>{provider.name}官方域名 · {provider.domain}</span><span className="status-path"><ShieldCheck size={12} />凭据不持久化</span></footer>
+        <footer className="status-bar">
+          <span className="connected"><i />Rust Cloud Signer 就绪</span>
+          <span>{provider.name}官方域名 · {provider.domain}</span>
+          <span className="status-path">
+            <ShieldCheck size={12} />
+            {describeCredentialMode(credentials) === "sts" ? "STS 会话凭据 · 不落盘" : "凭据仅内存 · 不落盘"}
+          </span>
+        </footer>
       </main>
       {notice && <div className="toast" role="status"><Check size={16} />{notice}</div>}
     </div>

@@ -37,6 +37,7 @@ import {
   useState,
 } from "react";
 import { api, normalizeError } from "./lib/ipc";
+import { patchWorkspaceMemory, readWorkspaceMemory } from "./lib/workspaceMemory";
 import { PreferenceControls } from "./components/PreferenceControls";
 import { WorkspaceSwitch, type WorkspaceMode } from "./components/WorkspaceSwitch";
 import { CloudConsole } from "./features/cloud/CloudConsole";
@@ -105,7 +106,7 @@ function compactUrl(baseUrl: string, configuredUrl: string) {
 }
 
 export default function App() {
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("catalog");
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(() => readWorkspaceMemory().mode);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [selectedAppId, setSelectedAppId] = useState<number | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<number | null>(null);
@@ -131,6 +132,10 @@ export default function App() {
   const [error, setError] = useState<CommandError | null>(null);
   const [notice, setNotice] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
+  const changeWorkspace = useCallback((mode: WorkspaceMode) => {
+    setWorkspaceMode(mode);
+    patchWorkspaceMemory({ mode });
+  }, []);
 
   const selectedApp = useMemo(
     () => catalog?.applications.find((application) => application.id === selectedAppId) ?? null,
@@ -159,6 +164,11 @@ export default function App() {
     setBaseUrl(application.baseUrl);
     setResponse(null);
     setError(null);
+    patchWorkspaceMemory({
+      catalogAppId: application.id,
+      catalogGroupId: group?.id ?? null,
+      catalogFunctionId: apiFunction?.id ?? null,
+    });
   }, []);
 
   const chooseGroup = useCallback((group: ApiGroup) => {
@@ -167,6 +177,10 @@ export default function App() {
     setExpandedGroups((current) => new Set(current).add(group.id));
     setResponse(null);
     setError(null);
+    patchWorkspaceMemory({
+      catalogGroupId: group.id,
+      catalogFunctionId: group.functions[0]?.id ?? null,
+    });
   }, []);
 
   const chooseFunction = useCallback((group: ApiGroup, apiFunction: FunctionSummary) => {
@@ -175,6 +189,7 @@ export default function App() {
     setExpandedGroups((current) => new Set(current).add(group.id));
     setResponse(null);
     setError(null);
+    patchWorkspaceMemory({ catalogGroupId: group.id, catalogFunctionId: apiFunction.id });
   }, []);
 
   useEffect(() => {
@@ -184,14 +199,23 @@ export default function App() {
       .then((loaded) => {
         if (!active) return;
         setCatalog(loaded);
-        if (loaded.applications[0]) chooseApplication(loaded.applications[0]);
+        const remembered = readWorkspaceMemory();
+        const application = loaded.applications.find((item) => item.id === remembered.catalogAppId) ?? loaded.applications[0];
+        if (!application) return;
+        const group = application.groups.find((item) => item.id === remembered.catalogGroupId) ?? application.groups[0] ?? null;
+        const apiFunction = group?.functions.find((item) => item.id === remembered.catalogFunctionId) ?? group?.functions[0] ?? null;
+        setSelectedAppId(application.id);
+        setSelectedGroupId(group?.id ?? null);
+        setSelectedFunctionId(apiFunction?.id ?? null);
+        setExpandedGroups(new Set(group ? [group.id] : []));
+        setBaseUrl(application.baseUrl);
       })
       .catch((reason) => active && setError(normalizeError(reason)))
       .finally(() => active && setCatalogLoading(false));
     return () => {
       active = false;
     };
-  }, [chooseApplication]);
+  }, []);
 
   useEffect(() => {
     if (selectedFunctionId === null) {
@@ -439,7 +463,7 @@ export default function App() {
           </div>
         </header>
 
-        <WorkspaceSwitch mode={workspaceMode} onChange={setWorkspaceMode} />
+        <WorkspaceSwitch mode={workspaceMode} onChange={changeWorkspace} />
 
         <div className="search-field">
           <Search size={15} />
@@ -851,12 +875,12 @@ export default function App() {
     <CloudConsole
       active={workspaceMode === "cloud"}
       workspaceMode={workspaceMode}
-      onWorkspaceChange={setWorkspaceMode}
+      onWorkspaceChange={changeWorkspace}
     />
     <StorageConsole
       active={workspaceMode === "storage"}
       workspaceMode={workspaceMode}
-      onWorkspaceChange={setWorkspaceMode}
+      onWorkspaceChange={changeWorkspace}
     />
     </>
   );

@@ -377,14 +377,24 @@ kbd { margin-right: 2px; padding: 2px 4px; border: 1px solid var(--border-strong
 .cloud-fields { display: grid; gap: 10px; }
 .cloud-fields label { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .cloud-fields label > span, .cloud-editors label > span { color: var(--text-muted); font-size: 9px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; }
-.cloud-fields input, .cloud-fields select, .cloud-endpoint-line input, .cloud-endpoint-line select, .cloud-editors textarea { min-width: 0; border: 1px solid var(--border); border-radius: 6px; outline: 0; color: var(--text); background: var(--surface-4); font-size: 11px; }
+.cloud-fields input, .cloud-fields select, .cloud-fields textarea, .cloud-endpoint-line input, .cloud-endpoint-line select, .cloud-editors textarea { min-width: 0; border: 1px solid var(--border); border-radius: 6px; outline: 0; color: var(--text); background: var(--surface-4); font-size: 11px; }
 .cloud-fields input, .cloud-fields select { width: 100%; height: 32px; padding: 0 9px; }
-.cloud-fields input:focus, .cloud-fields select:focus, .cloud-endpoint-line input:focus, .cloud-editors textarea:focus { border-color: var(--accent-line); box-shadow: 0 0 0 2px var(--accent-soft); }
+.cloud-fields input:focus, .cloud-fields select:focus, .cloud-fields textarea:focus, .cloud-endpoint-line input:focus, .cloud-editors textarea:focus { border-color: var(--accent-line); box-shadow: 0 0 0 2px var(--accent-soft); }
 .cloud-fields input:disabled { opacity: .5; }
-.credentials-fields { grid-template-columns: 1fr 1fr 1.1fr; padding: 12px; }
+.credentials-fields { grid-template-columns: 1fr 1fr; padding: 12px; }
 .secret-field > div { position: relative; }
 .secret-field input { padding-right: 34px; }
 .secret-field .icon-button { position: absolute; top: 4px; right: 4px; }
+.sts-token-field { grid-column: 1 / -1; }
+.sts-token-field textarea { width: 100%; min-height: 52px; padding: 8px 9px; resize: vertical; font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.credential-heading-actions { display: flex; align-items: center; gap: 6px; }
+.sts-badge { padding: 3px 7px; border-radius: 4px; color: var(--info); background: var(--info-soft); font: 700 9px/1.2 ui-monospace, monospace; }
+.sts-badge.aksk { color: var(--text-muted); background: var(--surface-2); }
+.sts-badge.soon { color: var(--warn); background: var(--warn-soft); }
+.sts-badge.expired { color: var(--danger); background: var(--danger-soft); }
+.credential-expiry { margin: 0 12px 12px; }
+.credentials-panel.collapsed .credentials-fields { display: none; }
+.credentials-panel.collapsed:not(:has(.credential-expiry)) .cloud-panel-heading { border-bottom: 0; }
 
 .cloud-preset-select { width: 260px; }
 .cloud-preset-select select { width: 100%; height: 31px; padding: 0 28px 0 9px; border: 1px solid var(--border); border-radius: 6px; appearance: none; color: var(--text-secondary); background: var(--surface-2); font-size: 9px; }
@@ -409,7 +419,12 @@ kbd { margin-right: 2px; padding: 2px 4px; border: 1px solid var(--border-strong
 .cloud-result-toolbar { min-height: 34px; padding: 6px 12px; border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; gap: 8px; background: var(--surface-4); }
 .cloud-result-toolbar strong { color: var(--text); font-size: 11px; }
 .cloud-result-toolbar span, .cloud-result-toolbar small { color: var(--text-muted); font-size: 10px; }
-.cloud-result-toolbar .button { margin-left: auto; height: 26px; min-width: 0; padding: 0 8px; font-size: 10px; }
+.cloud-result-toolbar .button { height: 26px; min-width: 0; padding: 0 8px; font-size: 10px; }
+.cloud-result-toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.cloud-result-error-flag { color: var(--danger); }
+.cloud-result-url { min-height: 30px; padding: 0 12px; border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 10px; }
+.cloud-result-url code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--code-text); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.cloud-result-table td { cursor: pointer; }
 .cloud-result-error { margin: 10px 12px 0; padding: 9px 11px; border: 1px solid var(--danger-line); border-radius: 6px; display: flex; flex-direction: column; gap: 3px; color: var(--danger); background: var(--danger-soft); }
 .cloud-result-error strong { font-size: 11px; }
 .cloud-result-error span { color: var(--text-secondary); font-size: 10px; line-height: 1.45; }

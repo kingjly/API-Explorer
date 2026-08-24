@@ -1,4 +1,5 @@
 import {
+  Activity,
   AlertCircle,
   Ban,
   Check,
@@ -7,29 +8,29 @@ import {
   Code2,
   Copy,
   Download,
-  Eye,
-  EyeOff,
   FileKey2,
   Folder,
   HardDrive,
-  KeyRound,
   Link2,
   List,
   LoaderCircle,
   LockKeyhole,
   Network,
   Play,
-  RotateCcw,
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { CredentialBar } from "../../components/CredentialBar";
 import { PreferenceControls } from "../../components/PreferenceControls";
 import { WorkspaceSwitch, type WorkspaceMode } from "../../components/WorkspaceSwitch";
 import { api, normalizeError } from "../../lib/ipc";
+import { describeCredentialMode, useSessionCredentials } from "../../lib/sessionCredentials";
+import { patchWorkspaceMemory, readWorkspaceMemory } from "../../lib/workspaceMemory";
 import type {
   CommandError,
   StorageOperation,
@@ -39,7 +40,16 @@ import type {
   StorageSignaturePreview,
 } from "../../types";
 
-type ResultTab = "body" | "headers" | "signature";
+type ResultTab = "body" | "headers" | "signature" | "history";
+
+interface StorageHistoryEntry {
+  id: string;
+  label: string;
+  method: string;
+  timestamp: Date;
+  response?: StorageResponse;
+  error?: CommandError;
+}
 
 interface ProviderMeta {
   name: string;
@@ -123,12 +133,18 @@ export function StorageConsole({
   workspaceMode: WorkspaceMode;
   onWorkspaceChange: (mode: WorkspaceMode) => void;
 }) {
-  const [providerId, setProviderId] = useState<StorageProvider>("alibabaOss");
-  const [operation, setOperation] = useState<StorageOperation>("listBuckets");
-  const [region, setRegion] = useState(PROVIDERS.alibabaOss.region);
-  const [bucket, setBucket] = useState(PROVIDERS.alibabaOss.bucket);
-  const [objectKey, setObjectKey] = useState("folder/example.txt");
-  const [prefix, setPrefix] = useState("");
+  const remembered = readWorkspaceMemory();
+  const initialProvider = PROVIDERS[remembered.storageProvider] ? remembered.storageProvider : "alibabaOss";
+  const initialOperation = OPERATIONS.some((item) => item.id === remembered.storageOperation)
+    ? remembered.storageOperation
+    : "listBuckets";
+  const [providerId, setProviderId] = useState<StorageProvider>(initialProvider);
+  const [operation, setOperation] = useState<StorageOperation>(initialOperation);
+  const [region, setRegion] = useState(remembered.storageRegion || PROVIDERS[initialProvider].region);
+  const [bucket, setBucket] = useState(remembered.storageBucket || PROVIDERS[initialProvider].bucket);
+  const [objectKey, setObjectKey] = useState(remembered.storageObjectKey || "folder/example.txt");
+  const [prefix, setPrefix] = useState(remembered.storagePrefix);
+  const [history, setHistory] = useState<StorageHistoryEntry[]>([]);
   const [delimiter, setDelimiter] = useState("/");
   const [maxKeys, setMaxKeys] = useState(100);
   const [localPath, setLocalPath] = useState("");
@@ -136,10 +152,7 @@ export function StorageConsole({
   const [contentType, setContentType] = useState("application/octet-stream");
   const [expiresSeconds, setExpiresSeconds] = useState(3600);
   const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
-  const [accessKeyId, setAccessKeyId] = useState("");
-  const [accessKeySecret, setAccessKeySecret] = useState("");
-  const [securityToken, setSecurityToken] = useState("");
-  const [showSecret, setShowSecret] = useState(false);
+  const { credentials } = useSessionCredentials();
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:8080");
   const [allowInvalidCertificates, setAllowInvalidCertificates] = useState(false);
@@ -184,12 +197,14 @@ export function StorageConsole({
     contentType,
     expiresSeconds,
     overwriteConfirmed,
-    credentials: { accessKeyId, accessKeySecret, securityToken },
+    credentials: {
+      accessKeyId: credentials.accessKeyId,
+      accessKeySecret: credentials.accessKeySecret,
+      securityToken: credentials.securityToken,
+    },
     proxyUrl: !isPresign && proxyEnabled ? proxyUrl : undefined,
     allowInvalidCertificates: !isPresign && allowInvalidCertificates,
   }), [
-    accessKeyId,
-    accessKeySecret,
     allowInvalidCertificates,
     bucket,
     contentType,
@@ -207,7 +222,7 @@ export function StorageConsole({
     proxyEnabled,
     proxyUrl,
     region,
-    securityToken,
+    credentials,
   ]);
 
   const run = useCallback(async () => {
@@ -221,15 +236,30 @@ export function StorageConsole({
       setResponse(result);
       setSignature(result.signature);
       setResultTab("body");
+      setHistory((current) => [{
+        id: requestId,
+        label: `${provider.shortName} · ${operationMeta.label}`,
+        method: operationMethod(operation),
+        timestamp: new Date(),
+        response: result,
+      }, ...current].slice(0, 20));
       if (result.presignedUrl) setNotice("预签名 URL 已在本机生成，未发送网络请求");
       if (result.savedPath) setNotice("对象已完整写入本地文件");
     } catch (reason) {
-      setError(normalizeError(reason));
+      const commandError = normalizeError(reason);
+      setError(commandError);
+      setHistory((current) => [{
+        id: requestId,
+        label: `${provider.shortName} · ${operationMeta.label}`,
+        method: operationMethod(operation),
+        timestamp: new Date(),
+        error: commandError,
+      }, ...current].slice(0, 20));
     } finally {
       setRequesting(false);
       setActiveRequestId(null);
     }
-  }, [buildRequest, requesting]);
+  }, [buildRequest, operation, operationMeta.label, provider.shortName, requesting]);
 
   const preview = useCallback(async () => {
     setError(null);
@@ -268,11 +298,17 @@ export function StorageConsole({
     setResponse(null);
     setSignature(null);
     setError(null);
+    patchWorkspaceMemory({
+      storageProvider: next,
+      storageRegion: meta.region,
+      storageBucket: meta.bucket,
+    });
   };
 
   const chooseOperation = (next: StorageOperation) => {
     setOperation(next);
     setOverwriteConfirmed(false);
+    patchWorkspaceMemory({ storageOperation: next });
     setResponse(null);
     setSignature(null);
     setError(null);
@@ -316,18 +352,13 @@ export function StorageConsole({
         </header>
 
         <div className="cloud-scroll">
-          <section className="cloud-panel credentials-panel">
-            <div className="cloud-panel-heading">
-              <KeyRound size={16} />
-              <div><strong>访问凭据</strong><span>仅当前工作区内存态；离开页面即清除</span></div>
-              <button className="button secondary" onClick={() => { setAccessKeyId(""); setAccessKeySecret(""); setSecurityToken(""); }} disabled={!accessKeyId && !accessKeySecret && !securityToken}><RotateCcw size={14} />清空</button>
-            </div>
-            <div className="cloud-fields credentials-fields">
-              <label><span>AccessKey ID / SecretId</span><input value={accessKeyId} onChange={(event) => setAccessKeyId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
-              <label className="secret-field"><span>AccessKey Secret / SecretKey</span><div><input type={showSecret ? "text" : "password"} value={accessKeySecret} onChange={(event) => setAccessKeySecret(event.target.value)} autoComplete="new-password" spellCheck={false} /><button className="icon-button small" onClick={() => setShowSecret((current) => !current)} aria-label={showSecret ? "隐藏密钥" : "显示密钥"}>{showSecret ? <EyeOff size={14} /> : <Eye size={14} />}</button></div></label>
-              <label><span>Security Token（可选）</span><input type="password" value={securityToken} onChange={(event) => setSecurityToken(event.target.value)} autoComplete="off" spellCheck={false} /></label>
-            </div>
-          </section>
+          <CredentialBar
+            title="访问凭据"
+            hint="与云 AK/SK 共用当前会话。可粘贴 STS JSON；SK 不落盘。"
+            idLabel="AccessKey ID / SecretId"
+            keyLabel="AccessKey Secret / SecretKey"
+            onNotice={setNotice}
+          />
 
           <section className="cloud-panel storage-request-panel">
             <div className="cloud-panel-heading">
@@ -349,14 +380,14 @@ export function StorageConsole({
 
             <div className="cloud-fields storage-resource-fields">
               <label><span>Provider</span><select value={providerId} onChange={(event) => chooseProvider(event.target.value as StorageProvider)}><option value="alibabaOss">阿里云 OSS</option><option value="tencentCos">腾讯云 COS</option><option value="baiduBos">百度智能云 BOS</option></select></label>
-              <label><span>Region</span><input value={region} onChange={(event) => setRegion(event.target.value)} spellCheck={false} /></label>
-              <label><span>Bucket</span><input value={bucket} onChange={(event) => setBucket(event.target.value)} disabled={!needsBucket} spellCheck={false} placeholder={needsBucket ? "bucket-name" : "桶列表不需要"} /></label>
-              <label className="storage-object-key"><span>Object Key</span><input value={objectKey} onChange={(event) => setObjectKey(event.target.value)} disabled={!needsObject} spellCheck={false} placeholder={needsObject ? "folder/example.txt" : "当前操作不需要"} /></label>
+              <label><span>Region</span><input value={region} onChange={(event) => { setRegion(event.target.value); patchWorkspaceMemory({ storageRegion: event.target.value }); }} spellCheck={false} /></label>
+              <label><span>Bucket</span><input value={bucket} onChange={(event) => { setBucket(event.target.value); patchWorkspaceMemory({ storageBucket: event.target.value }); }} disabled={!needsBucket} spellCheck={false} placeholder={needsBucket ? "bucket-name" : "桶列表不需要"} /></label>
+              <label className="storage-object-key"><span>Object Key</span><input value={objectKey} onChange={(event) => { setObjectKey(event.target.value); patchWorkspaceMemory({ storageObjectKey: event.target.value }); }} disabled={!needsObject} spellCheck={false} placeholder={needsObject ? "folder/example.txt" : "当前操作不需要"} /></label>
             </div>
 
             {isListObjects && (
               <div className="cloud-fields storage-list-fields">
-                <label><span>Prefix</span><input value={prefix} onChange={(event) => setPrefix(event.target.value)} spellCheck={false} placeholder="可选对象前缀" /></label>
+                <label><span>Prefix</span><input value={prefix} onChange={(event) => { setPrefix(event.target.value); patchWorkspaceMemory({ storagePrefix: event.target.value }); }} spellCheck={false} placeholder="可选对象前缀" /></label>
                 <label><span>Delimiter</span><input value={delimiter} onChange={(event) => setDelimiter(event.target.value)} maxLength={1} spellCheck={false} /></label>
                 <label><span>Max Keys</span><input type="number" min={1} max={1000} value={maxKeys} onChange={(event) => setMaxKeys(Number(event.target.value))} /></label>
               </div>
@@ -389,12 +420,17 @@ export function StorageConsole({
             <div className="storage-runbar">
               <div><code>{operationMethod(operation)}</code><span>{provider.domain} 官方 HTTPS Endpoint 由 Rust 自动生成</span></div>
               {requesting ? <button className="button danger" onClick={() => void cancel()}><Ban size={15} />取消</button>
-                : <button className={`button ${isUpload ? "warning" : "primary"}`} onClick={() => void run()} disabled={isUpload && !overwriteConfirmed}>{isPresign ? <Link2 size={15} /> : isUpload ? <Upload size={15} /> : isDownload ? <Download size={15} /> : <Play size={15} />}{isPresign ? "生成预签名 URL" : isUpload ? "确认并上传" : isDownload ? "下载到本地" : "签名并查询"}</button>}
+                : <button
+                    className={`button ${isUpload ? "warning" : "primary"}`}
+                    onClick={() => void run()}
+                    disabled={(isUpload && !overwriteConfirmed) || !credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim()}
+                    title={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim() ? "先填写 AccessKey ID 和 Secret" : undefined}
+                  >{isPresign ? <Link2 size={15} /> : isUpload ? <Upload size={15} /> : isDownload ? <Download size={15} /> : <Play size={15} />}{isPresign ? "生成预签名 URL" : isUpload ? "确认并上传" : isDownload ? "下载到本地" : "签名并查询"}</button>}
             </div>
           </section>
 
           {allowInvalidCertificates && !isPresign && <div className="inline-warning storage-warning"><ShieldAlert size={14} />TLS 证书校验已关闭，只应在受信任的代理测试环境中使用。</div>}
-          {providerId === "baiduBos" && isPresign && securityToken && <div className="inline-warning storage-warning"><ShieldAlert size={14} />BOS 官方要求 STS 预签名调用方另带 Token 请求头，本工具会拒绝生成不可直接使用的链接。</div>}
+          {providerId === "baiduBos" && isPresign && credentials.securityToken && <div className="inline-warning storage-warning"><ShieldAlert size={14} />BOS 官方要求 STS 预签名调用方另带 Token 请求头，本工具会拒绝生成不可直接使用的链接。</div>}
 
           {error && <div className={`error-banner cloud-error ${error.code === "cancelled" ? "neutral" : ""}`} role="alert"><AlertCircle size={17} /><div><strong>{error.code === "cancelled" ? "操作已停止" : "对象存储操作失败"}</strong><span>{error.message}</span></div><button className="icon-button small" onClick={() => setError(null)} aria-label="关闭错误"><X size={14} /></button></div>}
 
@@ -404,11 +440,40 @@ export function StorageConsole({
                 <button className={resultTab === "body" ? "active" : ""} onClick={() => setResultTab("body")}><Code2 size={15} />结果</button>
                 <button className={resultTab === "headers" ? "active" : ""} onClick={() => setResultTab("headers")}><SlidersHorizontal size={15} />响应头 {response && <small>{response.headers.length}</small>}</button>
                 <button className={resultTab === "signature" ? "active" : ""} onClick={() => setResultTab("signature")}><LockKeyhole size={15} />签名诊断</button>
+                <button className={resultTab === "history" ? "active" : ""} onClick={() => setResultTab("history")}><Activity size={15} />历史 {history.length ? <small>{history.length}</small> : null}</button>
               </div>
-              {response && <div className="response-meta"><span className={`status-pill ${statusTone(response.status)}`}>{response.status ?? "LOCAL"} {response.statusText}</span>{response.elapsedMs > 0 && <span><Clock3 size={13} />{response.elapsedMs} ms</span>}{response.bytesTransferred > 0 && <span>{response.bytesTransferred.toLocaleString()} bytes</span>}</div>}
+              {response && resultTab !== "history" && <div className="response-meta"><span className={`status-pill ${statusTone(response.status)}`}>{response.status ?? "LOCAL"} {response.statusText}</span>{response.elapsedMs > 0 && <span><Clock3 size={13} />{response.elapsedMs} ms</span>}{response.bytesTransferred > 0 && <span>{response.bytesTransferred.toLocaleString()} bytes</span>}</div>}
             </div>
             <div className="cloud-result-content">
               {requesting ? <div className="response-empty"><LoaderCircle className="spin" size={24} /><strong>{isUpload ? "正在流式上传对象" : isDownload ? "正在流式下载对象" : "正在等待对象存储响应"}</strong><span>按 Esc 可取消当前操作</span></div>
+                : resultTab === "history" ? history.length ? <div className="history-list">
+                  {history.map((entry) => (
+                    <button
+                      key={entry.id}
+                      className="history-row"
+                      onClick={() => {
+                        if (entry.response) {
+                          setResponse(entry.response);
+                          setSignature(entry.response.signature);
+                          setError(null);
+                          setResultTab("body");
+                        }
+                      }}
+                      disabled={!entry.response}
+                    >
+                      <span className={`method method-${entry.method.toLowerCase()}`}>{entry.method}</span>
+                      <strong>{entry.label}</strong>
+                      <time>{entry.timestamp.toLocaleTimeString()}</time>
+                      {entry.response ? (
+                        <span className={`status-text ${statusTone(entry.response.status)}`}>{entry.response.status ?? "LOCAL"}</span>
+                      ) : (
+                        <span className="status-text error">失败</span>
+                      )}
+                      <span className="history-duration">{entry.response ? `${entry.response.elapsedMs} ms` : entry.error?.message}</span>
+                    </button>
+                  ))}
+                  <button className="clear-history" onClick={() => setHistory([])}><Trash2 size={14} />清空历史</button>
+                </div> : <div className="response-empty"><Activity size={24} /><strong>还没有请求记录</strong><span>执行后可在这里对照本次会话的结果</span></div>
                 : resultTab === "signature" ? signature ? <div className="signature-diagnostics">
                   <div className="signature-summary"><span>{signature.algorithm}</span><span>{signature.timestamp}</span><span>{signature.signedHeaders}</span>{signature.redacted && <i>已脱敏</i>}</div>
                   {[["Canonical Request", signature.canonicalRequest], ["String to Sign", signature.stringToSign], ["Authorization / Signed URL", signature.authorization]].map(([label, value]) => <section key={label}><header><strong>{label}</strong><button className="icon-button small" onClick={() => void copy(value, `${label} 已复制`)} aria-label={`复制 ${label}`}><Copy size={14} /></button></header><pre><code>{value}</code></pre></section>)}
@@ -423,7 +488,7 @@ export function StorageConsole({
           </section>
         </div>
 
-        <footer className="status-bar"><span className="connected"><i />Rust Storage Adapter 就绪</span><span>{provider.name}</span><span className="status-path"><ShieldCheck size={12} />SK 不落盘 · 下载不覆盖</span></footer>
+        <footer className="status-bar"><span className="connected"><i />Rust Storage Adapter 就绪</span><span>{provider.name}</span><span className="status-path"><ShieldCheck size={12} />{describeCredentialMode(credentials) === "sts" ? "STS 会话凭据 · 不落盘" : "SK 不落盘 · 下载不覆盖"}</span></footer>
       </main>
       {notice && <div className="toast" role="status"><Check size={16} />{notice}</div>}
     </div>
