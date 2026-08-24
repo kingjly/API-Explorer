@@ -1,241 +1,114 @@
-# API-Explorer
+# API Explorer
 
-## 下载了Releases版本后，需要在源码页面将ApiInfo2.0.db文件下载到本地放到程序目录
+API Explorer 3.5 已从 PyQt5 重构为 **Rust + Tauri v2 + React** 桌面应用。它读取 `ApiInfo2.0.db` 接口库，用于管理和调用预配置的厂商 API，并提供独立的云 API AK/SK 与对象存储工作区。
 
-## **废话篇：**
+## 功能
 
-工具初衷是做一个小程序、公众号、企业微信、飞书、钉钉等泄露secert后利用工具，后来发现几家接口有一定区别，认证等参数分布在不同位置，索性就做成一个比较通用的工具了。目前可以定义：请求类型、url、header、body、正则提取认证token、接口参数说明。
+- 按应用、分组和接口浏览 138 个 API 配置
+- 支持 GET、POST、PUT、PATCH、DELETE 等合法 HTTP 方法，以及 JSON 与表单请求体
+- 支持 `{id}`、`{secert}`、`{token}` 模板替换
+- 支持 Token JSON 字段、正则及响应 Cookie 提取
+- 展示接口规范状态、版本、核验日期、变更说明和官方文档
+- 支持 Base URL 覆盖、HTTP/SOCKS 代理和可选的自签名证书模式
+- 可视化编辑 Path、Query、Header、Body 参数；认证模板保持只读
+- 展示状态码、耗时、响应头、格式化响应和会话请求历史
+- 长请求可通过界面、`Esc` 或取消按钮停止
+- `Ctrl+Enter` 发送请求、`Ctrl+K` 搜索接口、`F6` 切换主要窗格
+- 云 API 工作区支持阿里云、腾讯云、华为云、火山引擎、百度智能云的通用 AK/SK 签名、STS 临时 Token、签名预览及只读资源模板
+- 对象存储工作区支持阿里云 OSS、腾讯云 COS、百度智能云 BOS 的桶列表、对象列表、简单上传、流式下载及 GET/PUT 预签名 URL
+- 上传前必须显式确认同名对象覆盖风险；下载只写入新的本地文件，并在完整传输成功后原子完成
 
-![image](https://github.com/mrknow001/API-Explorer/assets/39295496/b6f0ee57-c351-4a33-adeb-c1de8365c149)
+## 技术架构
 
-## **功能介绍**
+```text
+React / TypeScript UI
+        │ Tauri IPC（仅注册的业务命令）
+        ▼
+Rust Core
+  ├─ rusqlite：本地接口库
+  ├─ HMAC / SHA-256：五家中国云服务商的本机签名适配器
+  ├─ OSS4 / COS SHA-1 / BCE V1：三家对象存储专用适配器
+  ├─ tokio stream：对象上传下载的有界内存流式 I/O
+  ├─ reqwest：HTTP / HTTPS / Proxy
+  └─ regex：Token 提取
+```
 
-​	API-Explorer是一款管理api接口的工具，可提前配置好接口，直接调用即可；可定义数据包任何位置内容，使用起来相当灵活。
-| 应用       | 功能     | 数据库接口       |
-| ---------- | -------- | ---------------- |
-| 微信公众号 | 支持     | 完成部分常用功能 |
-| 微信小程序 | 支持     | 完成部分常用功能 |
-| 企业微信   | 支持     | 完成部分常用功能 |
-| 钉钉      | 支持     | 完成部分常用功能  |
-| 飞书      | 支持     | 只写了两个接口    |
-| 腾讯地图   | 支持     | 完成部分常用功能  |
-| 高德地图   | 支持     | 完成部分常用功能  |
-| 百度地图   | 支持     | 完成部分常用功能  |
+前端不具备任意文件系统、Shell 或网络权限。数据库访问和外部 API 请求均由 Rust 命令执行；TLS 证书校验默认开启。
 
+云 API 没有嵌入需要额外运行时的 Java/Python/Node SDK。标准 OpenAPI 由 Rust 直接签名，当前覆盖阿里云 ACS3、腾讯云 TC3、华为云 SDK-HMAC、火山引擎 HMAC-SHA256 与百度智能云 BCE V1。对象存储另用专用 Rust 适配器实现 OSS V4、COS XML API 签名和 BOS BCE V1，不复用通用 JSON 请求编辑器。端点由 Rust 根据服务商、Region 与 Bucket 生成，只允许厂商官方 HTTPS 域名；AccessKey Secret 只在当前进程内存中参与签名，不写入 SQLite、浏览器存储或签名诊断。详见 [云 AK/SK 架构](docs/cloud-aksk-architecture.md)与[对象存储架构](docs/object-storage-architecture.md)。
 
+当前对象存储上传使用单次 PutObject，最大 5 GiB；更大对象、断点续传和并行分片上传不在 3.5 范围内。下载采用流式传输，目标文件已存在时会拒绝执行，传输未完成的临时文件会被清理。预签名 URL 只在本机生成，不发网络请求；BOS 使用 STS 预签名时官方还要求调用方额外携带 `x-bce-security-token` 请求头，因此工具会拒绝生成容易误用的链接。
 
-完成部分都是挖洞遇到过的key，边写边测试，如果遇到一些特殊情况无法使用可提交Issues或者联系“刨洞安全团队”公众号后台留言。
+## 开发
 
-如果有人愿意借用下key就可以继续完善，愿意贡献者联系“刨洞安全团队”公众号
+环境要求：
 
-## **更新说明**
-**v2.1.0**
+- Node.js 20+
+- Rust stable
+- Windows 上的 WebView2 与 Visual Studio C++ Build Tools
 
-功能变化：
+```bash
+npm install
+npm run tauri dev
+```
 
-1、增加代理功能
-2、修复已知bug
+只检查前端：
 
-使用说明：
+```bash
+npm run check
+npm run build
+```
 
-由于钉钉分为三种应用类型，目前只写了常见的内部应用开发。
+检查 Rust：
 
-由于钉钉的认证授权与功能模块使用的api域名不同，所以分成了两个应用写，分别是“钉钉-获取凭证”与“钉钉-其他功能”，使用时先用“钉钉-获取凭证”获取token，然后使用“钉钉-其他功能”调用其他接口。
+```bash
+cd src-tauri
+cargo test
+cargo check
+```
 
-**v2.0.0**
+## 打包
 
-功能变化：
+```bash
+npm run tauri build
+```
 
-1、新增自定义baseurl，能更好的应对私有化环境
-2、增加对飞书接口的支持
+安装包会包含 `ApiInfo2.0.db`。应用第一次启动时，会将数据库复制到系统应用数据目录；后续参数修改只写入该用户副本。接口目录升级时，应用会先创建带目录版本号的数据库备份，再更新受影响的厂商接口配置；这些接口上手动保存的参数可能被新版规范覆盖，可从备份恢复。实际路径显示在应用底部状态栏中。
 
-使用说明：
+### Windows 单 EXE 便携版
 
-application增加baseurl列，可在此列填写应用基础路径，能更好统一接口请求路径
+```bash
+npm run build:portable
+```
 
-function表中url字段，可以是路径，也可以是完整url
+产物位于 `artifacts/portable/`。默认接口库已经嵌入 EXE，首次运行时会在 EXE 所在目录释放可写的 `ApiInfo2.0.db`；后续参数和目录备份也保存在该目录，因此移动时应将 EXE 与运行后生成的数据库一起移动。程序仍依赖 Windows WebView2 Runtime，Windows 10/11 通常已经预装。
 
-优先级方面，以应用界面baseurl为最高，如果未设置则使用接口表中
+## 接口规范目录
 
-## **使用场景**
+3.2 的接口目录按 2026-08-06 可访问的厂商官方文档逐条复核，覆盖微信公众号、微信小程序、企业微信、百度/腾讯/高德地图、飞书、钉钉、绿盟 RSAS 与代理连通性检查。
 
-场景1-(公众号appid，secert泄露利用)：
+- 更新清单：[data/api_catalog_updates_2026-08-06.json](data/api_catalog_updates_2026-08-06.json)
+- 独立迁移工具：`python scripts/update_catalog.py --database ApiInfo2.0.db`
+- `active` 表示当前有效，`legacy` 表示仍有效但官方建议新实现迁移，`unverified` 表示公开官方资料不足，`test-only` 表示非正式厂商接口并禁止执行
 
-1、获取accesstoken
+原项目共有 87 条接口。3.2 目录共有 138 条：除复核和修订原有 87 条外，累计纳入 51 条真正新增接口，其中 50 条是本次针对 3.1 目录补入的 ID 89–138，另 1 条是此前补入的小程序稳定版 Token（ID 88）；同时新增 9 个功能分组。
 
-​	![image-20230808164018645](./img/image-20230808164018645.png)
+本次新增覆盖：公众号草稿创建/更新及发布流程，小程序手机号、URL Link 和内容安全，企业微信成员/部门删除、应用消息、客户联系和日程，百度/腾讯/高德的当前地图能力，飞书 OAuth、通讯录和 IM，以及钉钉 TOPAPI CRUD、v1.0 机器人和待办。目录是面向本工具常用场景的已核验精选集，并非厂商全部 OpenAPI 的完整镜像。
 
-2、使用此token访问其他接口
+每条正式记录的 `doc_url` 均指向相应官方规范。绿盟 RSAS 的详细二次开发规范未公开，相关固件接口仍明确标为 `unverified`；本地序列化测试项标为 `test-only` 并禁止发送。
 
-![image-20230808164144274](./img/image-20230808164144274.png)
+## 数据兼容性
 
-![image-20230808164421025](./img/image-20230808164421025.png)
+沿用原版三张核心表：
 
-有些时候拿到的appid跟secert公众号用不了，其实是它没有公众号，只有小程序，可以先用公众号接口获取token然后使用小程序接口获取其对应信息。
+- `application`：应用、认证字段名称、默认 Base URL
+- `group`：应用下的接口分组
+- `function`：方法、URL、请求参数、Token 规则和接口说明
 
-![image-20230808164729537](./img/image-20230808164729537.png)
+3.2 为 `function` 增加 `path_params`、`spec_status`、`spec_version`、`doc_url`、`verified_at`、`change_note`，并用 `api_catalog_metadata` 记录目录版本。旧用户数据库首次启动时会自动备份并原地迁移，重复执行迁移是幂等的；即使目录版本号已更新，缺失的新分组或接口也会被自动修复。
 
-地图系列
-![image-20230808164729537](./img/image-20240411103829.png)
+仓库中的原 PyQt5 文件暂时保留，便于核对迁移行为；新版本入口为 `package.json` 与 `src-tauri/`。
 
-场景2-(设备巡检)：
+## 安全提示
 
-绿盟扫描器
-
-![image-20230808165609236](./img/image-20230808165609236.png)
-
-绿盟UTS
-
-获取token，注意这里密码加密后的，为了通用工具不做任何加密，所以加好密传入才行。获取加密办法：
-
-f12后登录页面输入账号密码，找到authen_user接口，获取password内容即可。这个密码可复用，只要不改密码就可以一直用。
-
-![image-20230808170914634](./img/image-20230808170914634.png)
-
-![image-20230808170528108](./img/image-20230808170528108.png)
-
-使用token获取设备信息
-
-![image-20230808170625614](./img/image-20230808170625614.png)
-
-![image-20230808170726084](./img/image-20230808170726084.png)
-
-场景3-(签到类)：
-
-​	没有实践，目前支持账号密码登录获取cookie，可以再加个签到接口即可。
-
-## 使用说明
-
-### **认证区域**
-
-![image-20230808190520469](./img/image-20230808190520469.png)
-
-- 由于标签可能不一样，第一行第一个就以id标识，第二个以key表示，第二行以token表示
-
-- 目前考虑的认证有三种，分别是：
-
-  1. 账号密码获取token(响应body)
-
-  1. 账号密码获取cookie(响应头)
-
-  1. 使用固定请求头，例如Basic认证或者api授权key
-
-- 前两者需要输入id跟key获取token再使用，所以需要先点击"获取Token"，如果能获取到Token将会自动填充在token处
-
-- 如果是第三种方式直接填写token使用即可。
-
-- Basic认证可直接输入"账号:密码"，然后点击Base64编码即可。
-
-### **功能区域**
-
-![image-20230808191938790](./img/image-20230808191938790.png)
-
-两个下拉框第一个是分组，第二个是接口。为了防止接口数量太多使用起来不便，所以尽量对接口分组。
-
-"接口说明"点击弹出内容为该接口请求与响应字段信息，方便使用。
-
-"接口配置"可对配置接口值进行修改。说明：该处修改会影响数据库默认数据，但不影响有特殊标识的字段。
-
-"获取"功能即请求该接口，并将响应输出到日志区。
-
-"清空日志"回将日志区内容清空。
-
-### **日志区域**
-
-为了展示所有内容，不好以可视化或者其他方式展示，直接将响应body原样输出了。(暂时没想到，如果有方案可以指导下)
-
-![image-20230808193301391](./img/image-20230808193301391.png)
-
-## 接口编写
-
-### 数据库关系结构图
-
-<img src="./img/image-20230808172931003.png" alt="image-20230808172931003" style="zoom:50%;" />
-
-![image-20230808173749367](./img/image-20230808173749367.png)
-
-![image-20230808173758764](./img/image-20230808173758764.png)
-
-![image-20230808173814415](./img/image-20230808173814415.png)
-
-### 流程
-
-1. 先在application表创建应用，如果有就忽略，id_tab跟key_tab是第一行两个输入框的table名。
-2. 在group表创建分组，这个随意分，主要用于接口多好区分，app_id对应应用的id。
-3. 最关键的一步就是function表了，写接口详情的，接下来重点也是讲这个。
-
-### 接口信息创建
-
-**字段信息**
-
-| 字段         | 作用                                                         |
-| ------------ | ------------------------------------------------------------ |
-| id           | 唯一ID                                                       |
-| group_id     | 分组id                                                       |
-| function     | 接口名，在下拉框处显示的名字                                 |
-| type         | 请求类型，GET or  POST                                       |
-| url          | 请求url                                                      |
-| headers      | 请求头                                                       |
-| get_params   | get参数                                                      |
-| content_type | body类型，目前仅支持x-www-form-urlencoded与json              |
-| post_params  | post参数                                                     |
-| is_token     | 是否为token接口，该字段必填，如果不是获取token接口为0，反之为1 |
-| token_re     | 响应内容提取token的正则表达式                                |
-| api_doc      | 接口文档或说明，爱怎么写怎么写，有换行可以在记事本写好复制进去。 |
-
-### 说明
-
-- 目前接口配置中内置三个特殊标识，{id},{secert},{token}，分别对应第一排两个输入框与第二排一个输入框。表示从输入框获取值。
-
-  ![image-20230808185746865](./img/image-20230808185746865.png)
-
-  注：特殊标识可使用在headers、get_params、post_params
-
-- "接口说明"弹窗内容对应api_doc内容
-
-- "接口配置"可修改内置默认参数值（只做修改不能增删），但不影响特殊标识内容。
-
-- get参数、header以及json跟from格式的body，都以“参=值&参=值”的形式表达。
-
-- json跟列表嵌套，嵌套内容在不支持单独修改，所以嵌套内容需要这样写：
-
-  原数据：{"a":"1","b":"2","c":{"aaa":"111"},"d":[1,2,3]}写成a="1"&b="2"&c={"aaa":"111"}&d=[1,2,3]
-
-- content_type目前仅支持application/x-www-form-urlencoded与application/json
-
-### 示例
-
-第一组示例
-
-| 字段         | 示例                                                         | 说明                                                         |
-| ------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| id           | 1                                                            | 自动递增，无需理会                                           |
-| group_id     | 1                                                            | 对应组ID，按需填入                                           |
-| function     | 获取token                                                    | 接口名，下拉处显示                                           |
-| type         | GET                                                          | 请求方法                                                     |
-| url          | https://api.weixin.qq.com/cgi-bin/token                      | 接口URL                                                      |
-| headers      |                                                              | 没有特殊需求即留空                                           |
-| get_params   | grant_type=client_credential&appid={id}&secret={secert}      | client_credential为预设参数<br />{id}代表从输入框1获取<br />{secert}代表从输入框2获取 |
-| content_type |                                                              | 没有特殊需求即留空                                           |
-| post_params  |                                                              | 没有特殊需求即留空                                           |
-| is_token     | 1                                                            | 如果为1，点击"获取token"时就会调用该接口。<br />但同一个分组下有多个只会取第一个 |
-| token_re     | "access_token":"([\w\-]+)"                                   | 用于正则提取body中token的正则表达式                          |
-| api_doc      | 本接口获取token<br />grant_type参数值固定为client_credential<br />appid与secert为用户传入 | 接口描述                                                     |
-
-第二组示例
-
-| 字段         | 示例                                                         | 说明               |
-| ------------ | ------------------------------------------------------------ | ------------------ |
-| id           | 12                                                           | 自动递增，无需理会 |
-| group_id     | 7                                                            | 对应组ID，按需填入 |
-| function     | 获取草稿列表                                                 | 接口名，下拉处显示 |
-| type         | POST                                                         | 请求方法           |
-| url          | https://api.weixin.qq.com/cgi-bin/draft/batchget             | 接口URL            |
-| headers      | Authorization=Basic {token}                                  | 请求头             |
-| get_params   | accept=json                                                  | get参数            |
-| content_type | application/json                                             | body内容格式       |
-| post_params  | {"params1":"value1","params2":"value2"}                      | post参数           |
-| is_token     | 0                                                            | 是否为token接口    |
-| token_re     |                                                              | 不是token接口留空  |
-| api_doc      | 相应内容：<br />offset	 从全部素材的该偏移位置开始返回，0表示从第一个素材返回<br/>count	 返回素材的数量，取值在1到20之间<br/>no_content	 1 表示不返回 content 字段，0 表示正常返回，默认为 0 | 接口描述           |
-
+仅对你有权访问和测试的 API 使用本工具。认证信息只保存在当前界面状态中，不写入浏览器存储。开启“允许无效证书”会关闭 TLS 证书校验，只应在受信任的测试环境中短时使用。
