@@ -12,12 +12,16 @@ export function CredentialBar({
   hint,
   idLabel = "AccessKey ID",
   keyLabel = "AccessKey Secret",
+  tokenLabel = "STS Security Token",
+  secretOptional = false,
   onNotice,
 }: {
   title: string;
   hint: string;
   idLabel?: string;
   keyLabel?: string;
+  tokenLabel?: string;
+  secretOptional?: boolean;
   onNotice: (message: string) => void;
 }) {
   const { credentials, setCredentials, replaceCredentials, clearCredentials } = useSessionCredentials();
@@ -26,7 +30,7 @@ export function CredentialBar({
   const mode = describeCredentialMode(credentials);
   const expiry = expirationStatus(credentials.expiration, now);
   const filled = Boolean(credentials.accessKeyId || credentials.accessKeySecret || credentials.securityToken);
-  const ready = Boolean(credentials.accessKeyId.trim() && credentials.accessKeySecret.trim());
+  const ready = Boolean(credentials.accessKeyId.trim() && (secretOptional || credentials.accessKeySecret.trim()));
   const [open, setOpen] = useState(!ready);
   const akPreview = credentials.accessKeyId.length > 8
     ? `${credentials.accessKeyId.slice(0, 4)}…${credentials.accessKeyId.slice(-4)}`
@@ -136,7 +140,7 @@ export function CredentialBar({
           </div>
         </label>
         <label className="sts-token-field">
-          <span>STS Security Token</span>
+          <span>{tokenLabel}</span>
           <textarea
             value={credentials.securityToken}
             onChange={(event) => setCredentials({ securityToken: event.target.value })}

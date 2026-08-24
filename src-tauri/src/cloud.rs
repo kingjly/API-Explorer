@@ -1,4 +1,5 @@
 use crate::AppError;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::{
@@ -6,6 +7,7 @@ use reqwest::{
     Client, Method, Proxy, Url,
 };
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
     str::FromStr,
@@ -14,6 +16,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +26,9 @@ pub(crate) enum CloudProvider {
     HuaweiSdkHmac,
     VolcengineHmac,
     BaiduBceV1,
+    EzvizLapp,
+    TiandituTk,
+    QiniuMac,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +243,9 @@ fn prepare(
             CloudProvider::HuaweiSdkHmac => "application/json",
             CloudProvider::VolcengineHmac => "application/json",
             CloudProvider::BaiduBceV1 => "application/json; charset=utf-8",
+            CloudProvider::EzvizLapp => "application/x-www-form-urlencoded",
+            CloudProvider::TiandituTk => "application/json",
+            CloudProvider::QiniuMac => "application/x-www-form-urlencoded",
         }
     } else {
         request.content_type.trim()
@@ -294,6 +303,9 @@ fn prepare(
             content_type,
             timestamp,
         ),
+        CloudProvider::EzvizLapp => prepare_ezviz(request, method, url, host, content_type),
+        CloudProvider::TiandituTk => prepare_tianditu(request, method, url, host),
+        CloudProvider::QiniuMac => prepare_qiniu(request, method, url, host, content_type, timestamp),
     }
 }
 
@@ -800,17 +812,259 @@ fn prepare_baidu(
     })
 }
 
-fn validate_request(request: &CloudRequest) -> Result<(), AppError> {
-    for (value, label) in [
-        (&request.credentials.access_key_id, "AccessKey ID"),
-        (&request.credentials.access_key_secret, "AccessKey Secret"),
-    ] {
-        if value.trim().is_empty() {
+fn prepare_ezviz(
+    request: &CloudRequest,
+    method: Method,
+    url: Url,
+    host: String,
+    content_type: &str,
+) -> Result<PreparedRequest, AppError> {
+    if method != Method::POST {
+        return Err(AppError::new(
+            "unsupported_cloud_method",
+            "萤石开放平台 lapp 接口使用 POST + form",
+        ));
+    }
+    let is_token = url.path().contains("/token/get")
+        || request.action.eq_ignore_ascii_case("tokenGet");
+    let body = if is_token {
+        upsert_form(
+            &request.body,
+            &[
+                ("appKey", request.credentials.access_key_id.trim()),
+                ("appSecret", request.credentials.access_key_secret.trim()),
+            ],
+        )
+    } else {
+        let token = request.credentials.security_token.trim();
+        if token.is_empty() {
             return Err(AppError::new(
                 "missing_cloud_field",
-                format!("{label} 不能为空"),
+                "萤石业务接口需要 AccessToken，请先获取 Token 或填入 Token 栏",
             ));
         }
+        upsert_form(&request.body, &[("accessToken", token)])
+    };
+
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, ACCEPT, "application/json")?;
+    insert_header(&mut headers, HOST, &host)?;
+    insert_header(&mut headers, CONTENT_TYPE, content_type)?;
+
+    let secret = request.credentials.access_key_secret.trim();
+    let token = request.credentials.security_token.trim();
+    let mut preview_body = if secret.is_empty() {
+        body.clone()
+    } else {
+        body.replace(secret, "<redacted-app-secret>")
+    };
+    if !token.is_empty() {
+        preview_body = preview_body.replace(token, "<redacted-access-token>");
+    }
+    Ok(PreparedRequest {
+        method,
+        url,
+        headers,
+        body,
+        signature: CloudSignaturePreview {
+            algorithm: "ys7-lapp-form",
+            timestamp: String::new(),
+            signed_headers: "content-type;host".into(),
+            canonical_request: preview_body,
+            string_to_sign: if is_token {
+                "appKey + appSecret → /api/lapp/token/get".into()
+            } else {
+                "accessToken + 业务表单".into()
+            },
+            authorization: format!("AppKey {}", mask_key_id(&request.credentials.access_key_id)),
+            redacted: true,
+        },
+    })
+}
+
+fn upsert_form(body: &str, pairs: &[(&str, &str)]) -> String {
+    let mut entries: Vec<(String, String)> = url::form_urlencoded::parse(body.trim().as_bytes())
+        .filter(|(key, _)| {
+            !pairs
+                .iter()
+                .any(|(name, _)| key.eq_ignore_ascii_case(name))
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    for (key, value) in pairs {
+        if !value.is_empty() {
+            entries.push(((*key).to_string(), (*value).to_string()));
+        }
+    }
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in entries {
+        serializer.append_pair(&key, &value);
+    }
+    serializer.finish()
+}
+
+fn form_value(query: &str, expected: &str) -> String {
+    url::form_urlencoded::parse(query.trim().trim_start_matches('?').as_bytes())
+        .find(|(key, _)| key == expected)
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
+fn urlsafe_b64(value: &str) -> String {
+    URL_SAFE.encode(value.as_bytes())
+}
+
+fn prepare_tianditu(
+    request: &CloudRequest,
+    method: Method,
+    mut url: Url,
+    host: String,
+) -> Result<PreparedRequest, AppError> {
+    if method != Method::GET {
+        return Err(AppError::new(
+            "unsupported_cloud_method",
+            "天地图 Web 服务使用 GET + tk",
+        ));
+    }
+    let tk = request.credentials.access_key_id.trim();
+    let next_query = upsert_form(url.query().unwrap_or(""), &[("tk", tk)]);
+    url.set_query(Some(&next_query));
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, ACCEPT, "application/json")?;
+    insert_header(&mut headers, HOST, &host)?;
+    Ok(PreparedRequest {
+        method,
+        url,
+        headers,
+        body: String::new(),
+        signature: CloudSignaturePreview {
+            algorithm: "tianditu-tk",
+            timestamp: String::new(),
+            signed_headers: "host".into(),
+            canonical_request: next_query.replace(tk, "<redacted-tk>"),
+            string_to_sign: "Query 追加 tk".into(),
+            authorization: format!("tk {}", mask_key_id(&request.credentials.access_key_id)),
+            redacted: true,
+        },
+    })
+}
+
+fn prepare_qiniu(
+    request: &CloudRequest,
+    method: Method,
+    mut url: Url,
+    host: String,
+    content_type: &str,
+    timestamp: i64,
+) -> Result<PreparedRequest, AppError> {
+    if request.action.eq_ignore_ascii_case("stat") {
+        let source = url.query().unwrap_or("");
+        let bucket = form_value(source, "bucket");
+        let key = form_value(source, "key");
+        if !bucket.is_empty() && !key.is_empty() {
+            url.set_path(&format!("/stat/{}", urlsafe_b64(&format!("{bucket}:{key}"))));
+            url.set_query(None);
+        }
+    }
+    if request.action.eq_ignore_ascii_case("queryRegion") {
+        let next_query = upsert_form(
+            url.query().unwrap_or(""),
+            &[("ak", request.credentials.access_key_id.trim())],
+        );
+        url.set_query(Some(&next_query));
+    }
+    let date = utc_datetime(timestamp)?
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let path = if url.path().is_empty() {
+        "/".to_string()
+    } else {
+        url.path().to_string()
+    };
+    let query = url.query().unwrap_or("");
+    let include_body = !request.body.is_empty() && content_type != "application/octet-stream";
+    let mut signing = format!("{} {path}", method.as_str());
+    if !query.is_empty() {
+        signing.push('?');
+        signing.push_str(query);
+    }
+    signing.push_str("\nHost: ");
+    signing.push_str(&host);
+    if !content_type.is_empty() {
+        signing.push_str("\nContent-Type: ");
+        signing.push_str(content_type);
+    }
+    signing.push_str("\nX-Qiniu-Date: ");
+    signing.push_str(&date);
+    signing.push_str("\n\n");
+    if include_body {
+        signing.push_str(&request.body);
+    }
+    let sign = hmac_sha1(
+        request.credentials.access_key_secret.as_bytes(),
+        signing.as_bytes(),
+    )?;
+    let encoded = URL_SAFE.encode(sign);
+    let authorization = format!(
+        "Qiniu {}:{}",
+        request.credentials.access_key_id.trim(),
+        encoded
+    );
+
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, ACCEPT, "application/json")?;
+    insert_header(&mut headers, HOST, &host)?;
+    insert_header(&mut headers, AUTHORIZATION, &authorization)?;
+    insert_named_header(&mut headers, "X-Qiniu-Date", &date)?;
+    if !content_type.is_empty() {
+        insert_header(&mut headers, CONTENT_TYPE, content_type)?;
+    }
+
+    Ok(PreparedRequest {
+        method,
+        url,
+        headers,
+        body: request.body.clone(),
+        signature: CloudSignaturePreview {
+            algorithm: "qiniu-mac",
+            timestamp: date,
+            signed_headers: "content-type;host;x-qiniu-date".into(),
+            canonical_request: signing,
+            string_to_sign: format!(
+                "Qiniu {}:{}",
+                mask_key_id(&request.credentials.access_key_id),
+                encoded
+            ),
+            authorization: format!(
+                "Qiniu {}:{}",
+                mask_key_id(&request.credentials.access_key_id),
+                encoded
+            ),
+            redacted: false,
+        },
+    })
+}
+
+fn hmac_sha1(key: &[u8], value: &[u8]) -> Result<Vec<u8>, AppError> {
+    let mut mac = HmacSha1::new_from_slice(key)
+        .map_err(|_| AppError::new("signature_error", "无法初始化 HMAC-SHA1"))?;
+    mac.update(value);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn validate_request(request: &CloudRequest) -> Result<(), AppError> {
+    if request.credentials.access_key_id.trim().is_empty() {
+        let label = if matches!(request.provider, CloudProvider::TiandituTk) {
+            "天地图 tk"
+        } else {
+            "AccessKey ID"
+        };
+        return Err(AppError::new("missing_cloud_field", format!("{label} 不能为空")));
+    }
+    if !matches!(request.provider, CloudProvider::TiandituTk)
+        && request.credentials.access_key_secret.trim().is_empty()
+    {
+        return Err(AppError::new("missing_cloud_field", "AccessKey Secret 不能为空"));
     }
     if matches!(
         request.provider,
@@ -875,6 +1129,30 @@ fn validate_endpoint(provider: CloudProvider, url: &Url) -> Result<(), AppError>
                 || host.ends_with(".baidubce.com")
                 || host == "bcebos.com"
                 || host.ends_with(".bcebos.com")
+        }
+        CloudProvider::EzvizLapp => {
+            host == "open.ys7.com"
+                || host.ends_with(".ys7.com")
+                || host == "open.ezvizlife.com"
+                || host.ends_with(".ezvizlife.com")
+        }
+        CloudProvider::TiandituTk => {
+            host == "tianditu.gov.cn"
+                || host.ends_with(".tianditu.gov.cn")
+                || host == "tianditu.com"
+                || host.ends_with(".tianditu.com")
+        }
+        CloudProvider::QiniuMac => {
+            host == "qiniu.com"
+                || host.ends_with(".qiniu.com")
+                || host == "qiniuapi.com"
+                || host.ends_with(".qiniuapi.com")
+                ||             host == "qbox.me"
+                || host.ends_with(".qbox.me")
+                || host == "qiniup.com"
+                || host.ends_with(".qiniup.com")
+                || host == "qiniuio.com"
+                || host.ends_with(".qiniuio.com")
         }
     };
     if !allowed {
@@ -1240,5 +1518,91 @@ mod tests {
             .signature
             .canonical_request
             .contains("temporary%2Ftoken%2Bvalue"));
+    }
+
+    #[test]
+    fn ezviz_token_form_injects_app_key_and_redacts_secret() {
+        let mut request = tencent_request();
+        request.provider = CloudProvider::EzvizLapp;
+        request.method = "POST".into();
+        request.endpoint = "https://open.ys7.com/api/lapp/token/get".into();
+        request.service.clear();
+        request.action = "tokenGet".into();
+        request.version.clear();
+        request.region.clear();
+        request.query.clear();
+        request.body.clear();
+        request.content_type = "application/x-www-form-urlencoded".into();
+        request.credentials.access_key_id = "app-key-demo".into();
+        request.credentials.access_key_secret = "app-secret-demo".into();
+        let prepared = prepare(&request, 1_745_729_029, None).expect("Ezviz token form should build");
+        assert!(prepared.body.contains("appKey=app-key-demo"));
+        assert!(prepared.body.contains("appSecret=app-secret-demo"));
+        assert!(!prepared.signature.canonical_request.contains("app-secret-demo"));
+    }
+
+    #[test]
+    fn ezviz_device_list_requires_access_token() {
+        let mut request = tencent_request();
+        request.provider = CloudProvider::EzvizLapp;
+        request.method = "POST".into();
+        request.endpoint = "https://open.ys7.com/api/lapp/device/list".into();
+        request.action = "deviceList".into();
+        request.body = "pageStart=0&pageSize=10".into();
+        request.content_type = "application/x-www-form-urlencoded".into();
+        request.credentials.security_token.clear();
+        let error = match prepare(&request, 1_745_729_029, None) {
+            Ok(_) => panic!("token should be required"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "missing_cloud_field");
+    }
+
+    #[test]
+    fn qiniu_official_move_vector_matches_without_date() {
+        let signing = "POST /move/bmV3ZG9jczpmaW5kX21hbi50eHQ=/bmV3ZG9jczpmaW5kLm1hbi50eHQ=\nHost: rs.qiniu.com\n\n";
+        let sign = hmac_sha1(b"MY_SECRET_KEY", signing.as_bytes()).expect("qiniu hmac");
+        assert_eq!(URL_SAFE.encode(sign), "1uLvuZM6l6oCzZFqkJ6oI4oFMVQ=");
+    }
+
+    #[test]
+    fn tianditu_injects_and_redacts_tk() {
+        let mut request = tencent_request();
+        request.provider = CloudProvider::TiandituTk;
+        request.method = "GET".into();
+        request.endpoint = "https://api.tianditu.gov.cn/geocoder".into();
+        request.action.clear();
+        request.version.clear();
+        request.region.clear();
+        request.service.clear();
+        request.query = r#"ds={"keyWord":"北京市"}"#.into();
+        request.body.clear();
+        request.credentials.access_key_id = "demo-tk-123456".into();
+        request.credentials.access_key_secret.clear();
+        let prepared = prepare(&request, 1_745_729_029, None).expect("tianditu should build");
+        assert!(prepared.url.query().unwrap_or("").contains("tk=demo-tk-123456"));
+        assert!(!prepared.signature.canonical_request.contains("demo-tk-123456"));
+    }
+
+    #[test]
+    fn qiniu_query_region_appends_access_key() {
+        let mut request = tencent_request();
+        request.provider = CloudProvider::QiniuMac;
+        request.method = "GET".into();
+        request.endpoint = "https://uc.qiniuapi.com/v4/query".into();
+        request.action = "queryRegion".into();
+        request.version.clear();
+        request.region.clear();
+        request.service.clear();
+        request.query = "bucket=demo-bucket".into();
+        request.body.clear();
+        request.credentials.access_key_id = "AKIDEXAMPLE1234".into();
+        request.credentials.access_key_secret = "SECRETEXAMPLE".into();
+        let prepared = prepare(&request, 1_745_729_029, None).expect("qiniu query region should build");
+        let query = prepared.url.query().unwrap_or("");
+        assert!(query.contains("bucket=demo-bucket"));
+        assert!(query.contains("ak=AKIDEXAMPLE1234"));
+        assert!(prepared.signature.authorization.starts_with("Qiniu "));
+        assert!(!prepared.signature.authorization.contains("SECRETEXAMPLE"));
     }
 }

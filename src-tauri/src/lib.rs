@@ -132,6 +132,12 @@ struct CatalogMigration {
     new_groups: Vec<GroupInsert>,
     #[serde(default)]
     new_functions: Vec<FunctionInsert>,
+    #[serde(default)]
+    removed_applications: Vec<i64>,
+    #[serde(default)]
+    removed_groups: Vec<i64>,
+    #[serde(default)]
+    removed_functions: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +335,36 @@ fn catalog_migration_needed(
             |row| row.get(0),
         )?;
         if !exists {
+            return Ok(true);
+        }
+    }
+    for function_id in &migration.removed_functions {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM function WHERE id = ?1)",
+            [*function_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(true);
+        }
+    }
+    for group_id in &migration.removed_groups {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM \"group\" WHERE id = ?1)",
+            [*group_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(true);
+        }
+    }
+    for application_id in &migration.removed_applications {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM application WHERE id = ?1)",
+            [*application_id],
+            |row| row.get(0),
+        )?;
+        if exists {
             return Ok(true);
         }
     }
@@ -612,6 +648,25 @@ fn apply_catalog_migration_document(path: &Path, document: &str) -> Result<(), B
                 function.change_note,
             ],
         )?;
+    }
+
+    for function_id in &migration.removed_functions {
+        transaction.execute("DELETE FROM function WHERE id = ?1", [*function_id])?;
+    }
+    for group_id in &migration.removed_groups {
+        transaction.execute("DELETE FROM function WHERE group_id = ?1", [*group_id])?;
+        transaction.execute("DELETE FROM \"group\" WHERE id = ?1", [*group_id])?;
+    }
+    for application_id in &migration.removed_applications {
+        transaction.execute(
+            "DELETE FROM function WHERE group_id IN (SELECT id FROM \"group\" WHERE app_id = ?1)",
+            [*application_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM \"group\" WHERE app_id = ?1",
+            [*application_id],
+        )?;
+        transaction.execute("DELETE FROM application WHERE id = ?1", [*application_id])?;
     }
 
     transaction.execute(
@@ -1499,7 +1554,15 @@ mod tests {
             .expect("function table should be readable");
         let function = read_function(&connection, 88).expect("new function should deserialize");
 
-        assert_eq!(application_count, 9);
+        assert_eq!(application_count, 8);
+        let nsfocus: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM application WHERE id = 4",
+                [],
+                |row| row.get(0),
+            )
+            .expect("removed application should be queryable");
+        assert_eq!(nsfocus, 0);
         assert_eq!(
             function_count,
             (migration.functions.len() + migration.new_functions.len()) as i64

@@ -9,6 +9,7 @@ import {
   Code2,
   Copy,
   FileKey2,
+  ListChecks,
   LoaderCircle,
   LockKeyhole,
   Network,
@@ -21,12 +22,14 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CredentialBar } from "../../components/CredentialBar";
 import { PreferenceControls } from "../../components/PreferenceControls";
 import { WorkspaceSwitch, type WorkspaceMode } from "../../components/WorkspaceSwitch";
 import { api, normalizeError } from "../../lib/ipc";
-import { describeCredentialMode, useSessionCredentials } from "../../lib/sessionCredentials";
+import { explainCloudFailure } from "../../lib/explainCloudFailure";
+import { describeCredentialMode, expirationStatus, useSessionCredentials } from "../../lib/sessionCredentials";
+import { extractEzvizToken } from "./parseCloudResult";
 import { patchWorkspaceMemory, readWorkspaceMemory } from "../../lib/workspaceMemory";
 import type {
   CloudProvider,
@@ -35,10 +38,19 @@ import type {
   CloudSignaturePreview,
   CommandError,
 } from "../../types";
+import { AccessProbeView } from "./AccessProbeView";
+import {
+  createProbe,
+  FATAL_PROBE_KINDS,
+  markRemainingSkipped,
+  probeFromCommandError,
+  probeFromResponse,
+  type AccessProbe,
+} from "./accessProbe";
 import { CloudResultView } from "./CloudResultView";
-import { findPreset, groupPresetsByProvider, PRESETS, PROVIDERS, presetMatchesQuery, type CloudPreset } from "./presets";
+import { applyRegionToPreset, enumerationPresets, findPreset, groupPresetsByProvider, PRESETS, PROVIDERS, presetMatchesQuery, REGION_OPTIONS, replaceQueryValue, type CloudPreset } from "./presets";
 
-type ResultTab = "body" | "headers" | "signature" | "history";
+type ResultTab = "body" | "headers" | "signature" | "history" | "access";
 
 interface CloudHistoryEntry {
   id: string;
@@ -80,7 +92,7 @@ export function CloudConsole({
     () => new Set([findPreset(readWorkspaceMemory().cloudPresetId).provider]),
   );
   const [history, setHistory] = useState<CloudHistoryEntry[]>([]);
-  const { credentials } = useSessionCredentials();
+  const { credentials, setCredentials } = useSessionCredentials();
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:8080");
   const [allowInvalidCertificates, setAllowInvalidCertificates] = useState(false);
@@ -92,8 +104,11 @@ export function CloudConsole({
   const [error, setError] = useState<CommandError | null>(null);
   const [notice, setNotice] = useState("");
   const [catalogQuery, setCatalogQuery] = useState("");
+  const [requestOpen, setRequestOpen] = useState(false);
+  const [probes, setProbes] = useState<AccessProbe[]>([]);
+  const [probing, setProbing] = useState(false);
+  const probeAbort = useRef(false);
 
-  const selectedPreset = useMemo(() => findPreset(presetId), [presetId]);
   const providerGroups = useMemo(() => groupPresetsByProvider(PRESETS), []);
   const visibleGroups = useMemo(() => {
     if (!catalogQuery.trim()) return providerGroups;
@@ -117,12 +132,31 @@ export function CloudConsole({
   const usesActionVersion = ["alibabaAcs3", "tencentTc3", "volcengineHmac"].includes(form.provider);
   const usesService = ["tencentTc3", "volcengineHmac"].includes(form.provider);
   const usesRegion = ["tencentTc3", "volcengineHmac"].includes(form.provider);
+  const queryRegion = form.query.match(/(?:^|&)RegionId=([^&]*)/)?.[1] ?? "";
+  const regionValue = form.region || queryRegion;
+  const showRegion = Boolean(REGION_OPTIONS[form.provider]?.length) || usesRegion || Boolean(queryRegion);
+  const regionChoices = Array.from(new Set([...(REGION_OPTIONS[form.provider] ?? []), regionValue].filter(Boolean)));
+  const isEzviz = form.provider === "ezvizLapp";
+  const isTianditu = form.provider === "tiandituTk";
+  const isQiniu = form.provider === "qiniuMac";
+  const canSign = Boolean(credentials.accessKeyId.trim() && (isTianditu || credentials.accessKeySecret.trim()));
+  const probeById = useMemo(() => new Map(probes.map((item) => [item.id, item])), [probes]);
 
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(""), 2400);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  const signedFields = useCallback(() => ({
+    credentials: {
+      accessKeyId: credentials.accessKeyId,
+      accessKeySecret: credentials.accessKeySecret,
+      securityToken: credentials.securityToken,
+    },
+    proxyUrl: proxyEnabled ? proxyUrl : undefined,
+    allowInvalidCertificates,
+  }), [allowInvalidCertificates, credentials, proxyEnabled, proxyUrl]);
 
   const buildRequest = useCallback((requestId = crypto.randomUUID()): CloudRequest => ({
     requestId,
@@ -136,14 +170,46 @@ export function CloudConsole({
     query: form.query,
     body: form.body,
     contentType: form.contentType,
-    credentials: {
-      accessKeyId: credentials.accessKeyId,
-      accessKeySecret: credentials.accessKeySecret,
-      securityToken: credentials.securityToken,
-    },
-    proxyUrl: proxyEnabled ? proxyUrl : undefined,
-    allowInvalidCertificates,
-  }), [allowInvalidCertificates, credentials, form, proxyEnabled, proxyUrl]);
+    ...signedFields(),
+  }), [form, signedFields]);
+
+  const buildPresetRequest = useCallback((preset: CloudPreset, requestId = crypto.randomUUID()): CloudRequest => ({
+    requestId,
+    provider: preset.provider,
+    method: preset.method,
+    endpoint: preset.endpoint,
+    service: preset.service,
+    action: preset.action,
+    version: preset.version,
+    region: preset.region,
+    query: preset.query,
+    body: preset.body,
+    contentType: preset.contentType,
+    ...signedFields(),
+  }), [signedFields]);
+
+  useEffect(() => {
+    setProbes([]);
+  }, [credentials.accessKeyId]);
+
+  const applyRegion = (region: string) => {
+    setForm((current) => {
+      const next = {
+        ...current,
+        region,
+        query: /(?:^|&)RegionId=/.test(current.query) ? replaceQueryValue(current.query, "RegionId", region) : current.query,
+      };
+      patchWorkspaceMemory({ cloudRegion: next.region, cloudQuery: next.query });
+      return next;
+    });
+  };
+
+  const rememberEzvizToken = (body: string) => {
+    const extracted = extractEzvizToken(body);
+    if (!extracted) return "";
+    setCredentials({ securityToken: extracted.accessToken, expiration: extracted.expiration });
+    return extracted.accessToken;
+  };
 
   const previewSignature = useCallback(async () => {
     setError(null);
@@ -158,13 +224,37 @@ export function CloudConsole({
   }, [buildRequest]);
 
   const sendRequest = useCallback(async () => {
-    if (requesting) return;
+    if (requesting || !canSign) return;
+    if (expirationStatus(credentials.expiration).kind === "expired") {
+      if (isEzviz) setCredentials({ securityToken: "", expiration: "" });
+      else {
+        setError({ code: "expired", message: "临时凭据已过期，请重新粘贴 STS JSON。" });
+        return;
+      }
+    }
     const requestId = crypto.randomUUID();
     setRequesting(true);
     setActiveRequestId(requestId);
     setError(null);
     try {
-      const result = await api.executeCloudRequest(buildRequest(requestId));
+      let token = isEzviz && expirationStatus(credentials.expiration).kind === "expired" ? "" : credentials.securityToken;
+      if (isEzviz && !token.trim() && form.id !== "ezviz-token-get") {
+        const tokenRequestId = crypto.randomUUID();
+        setActiveRequestId(tokenRequestId);
+        const tokenResult = await api.executeCloudRequest(buildPresetRequest(findPreset("ezviz-token-get"), tokenRequestId));
+        token = rememberEzvizToken(tokenResult.body);
+        if (!token) throw { code: "missing_cloud_field", message: "萤石 Token 接口没有返回 accessToken" };
+      }
+      setActiveRequestId(requestId);
+      const result = await api.executeCloudRequest({
+        ...buildRequest(requestId),
+        credentials: {
+          accessKeyId: credentials.accessKeyId,
+          accessKeySecret: credentials.accessKeySecret,
+          securityToken: token,
+        },
+      });
+      rememberEzvizToken(result.body);
       setResponse(result);
       setSignature(result.signature);
       setResultTab("body");
@@ -189,11 +279,78 @@ export function CloudConsole({
       setRequesting(false);
       setActiveRequestId(null);
     }
-  }, [buildRequest, form.label, form.method, form.product, requesting]);
+  }, [buildPresetRequest, buildRequest, canSign, credentials, form.id, form.label, form.method, form.product, isEzviz, rememberEzvizToken, requesting, setCredentials]);
 
   const cancelRequest = useCallback(async () => {
+    probeAbort.current = true;
     if (activeRequestId) await api.cancelRequest(activeRequestId);
   }, [activeRequestId]);
+
+  const enumerateAccess = useCallback(async () => {
+    if (requesting || probing || !canSign) return;
+    if (expirationStatus(credentials.expiration).kind === "expired") {
+      if (isEzviz) setCredentials({ securityToken: "", expiration: "" });
+      else {
+        setError({ code: "expired", message: "临时凭据已过期，请重新粘贴 STS JSON。" });
+        return;
+      }
+    }
+    const targets = enumerationPresets(form.provider);
+    probeAbort.current = false;
+    setProbing(true);
+    setRequesting(true);
+    setError(null);
+    setResultTab("access");
+    setProbes(targets.map(createProbe));
+
+    let sessionToken = isEzviz && expirationStatus(credentials.expiration).kind === "expired" ? "" : credentials.securityToken;
+    let stopReason = "";
+    for (const preset of targets) {
+      if (probeAbort.current) {
+        stopReason = "已取消，其余未测";
+        break;
+      }
+      if (createProbe(preset).status === "skipped") continue;
+      const requestId = crypto.randomUUID();
+      const adapted = applyRegionToPreset(preset, regionValue);
+      setActiveRequestId(requestId);
+      setProbes((current) => current.map((item) => (
+        item.id === preset.id ? { ...item, status: "running", detail: "探测中" } : item
+      )));
+      try {
+        const result = await api.executeCloudRequest({
+          ...buildPresetRequest(adapted, requestId),
+          credentials: {
+            accessKeyId: credentials.accessKeyId,
+            accessKeySecret: credentials.accessKeySecret,
+            securityToken: sessionToken,
+          },
+        });
+        sessionToken = rememberEzvizToken(result.body) || sessionToken;
+        const next = probeFromResponse(preset, result);
+        setProbes((current) => current.map((item) => (item.id === preset.id ? next : item)));
+        const fatal = next.status === "invalid" || next.status === "expired";
+        if (fatal) {
+          stopReason = next.detail || "密钥不可用，停止探测";
+          break;
+        }
+      } catch (reason) {
+        const commandError = normalizeError(reason);
+        const next = probeFromCommandError(preset, commandError);
+        setProbes((current) => current.map((item) => (item.id === preset.id ? next : item)));
+        if (commandError.code === "cancelled" || FATAL_PROBE_KINDS.has(explainCloudFailure(commandError).kind)) {
+          stopReason = commandError.code === "cancelled" ? "已取消，其余未测" : next.detail || "密钥不可用，停止探测";
+          break;
+        }
+      }
+    }
+
+    if (stopReason) setProbes((current) => markRemainingSkipped(current, stopReason));
+    setActiveRequestId(null);
+    setRequesting(false);
+    setProbing(false);
+    setNotice(stopReason && !stopReason.startsWith("已取消") ? stopReason : "只读权限探测完成");
+  }, [buildPresetRequest, canSign, credentials, form.provider, isEzviz, probing, regionValue, rememberEzvizToken, requesting, setCredentials]);
 
   useEffect(() => {
     if (!active) return;
@@ -209,17 +366,18 @@ export function CloudConsole({
   }, [active, activeRequestId, cancelRequest, sendRequest]);
 
   const applyPreset = (preset: CloudPreset) => {
-    setPresetId(preset.id);
-    setForm(preset);
-    setExpandedProviders((current) => new Set(current).add(preset.provider));
+    const next = applyRegionToPreset(preset, preset.provider === form.provider ? regionValue : "");
+    setPresetId(next.id);
+    setForm(next);
+    setExpandedProviders((current) => new Set(current).add(next.provider));
     setResponse(null);
     setSignature(null);
     setError(null);
     patchWorkspaceMemory({
-      cloudPresetId: preset.id,
-      cloudEndpoint: preset.endpoint,
-      cloudRegion: preset.region,
-      cloudQuery: preset.query,
+      cloudPresetId: next.id,
+      cloudEndpoint: next.endpoint,
+      cloudRegion: next.region,
+      cloudQuery: next.query,
     });
   };
 
@@ -248,6 +406,29 @@ export function CloudConsole({
   const copy = async (value: string, message: string) => {
     await navigator.clipboard.writeText(value);
     setNotice(message);
+  };
+
+  const useQiniuResultValue = (column: string, value: string) => {
+    const nextValue = value.trim();
+    if (!nextValue) return;
+    if (column === "name" && (form.resultKind === "bucketNameList" || form.resultKind === "bucketInfo")) {
+      const key = /(?:^|&)tbl=/.test(form.query) && !/(?:^|&)bucket=/.test(form.query) ? "tbl" : "bucket";
+      let next = replaceQueryValue(form.query, key, nextValue);
+      if (/(?:^|&)tbl=/.test(form.query) && key === "bucket") next = replaceQueryValue(next, "tbl", nextValue);
+      update("query", next);
+      void copy(nextValue, `已填入 ${key}=${nextValue}`);
+      return;
+    }
+    if (column === "name" && form.resultKind === "objectList") {
+      update("query", replaceQueryValue(form.query, "key", nextValue));
+      void copy(nextValue, `已填入 key=${nextValue}`);
+      return;
+    }
+    if (column === "region") {
+      void copy(nextValue, `机房 ${nextValue}，对象存储的机房填这个`);
+      return;
+    }
+    void copy(nextValue, `${column} 已复制`);
   };
 
   return (
@@ -302,7 +483,7 @@ export function CloudConsole({
                           <button
                             type="button"
                             key={preset.id}
-                            className={`function-button ${preset.id === presetId ? "active" : ""}`}
+                            className={`function-button ${preset.id === presetId ? "active" : ""} ${probeById.get(preset.id) ? `access-nav-${probeById.get(preset.id)?.status}` : ""}`}
                             onClick={() => applyPreset(preset)}
                             title={preset.description}
                           >
@@ -333,56 +514,80 @@ export function CloudConsole({
             <span>{provider.name}</span><span>/</span>
             <strong>{form.product} · {form.label}</strong>
           </div>
-          <div className="header-actions"><span className="shortcut-hint"><kbd>Ctrl</kbd><kbd>Enter</kbd> 发送</span><PreferenceControls /><span className="cloud-algorithm">{provider.algorithm}</span></div>
+          <div className="header-actions">
+            {showRegion && (
+              <label className="header-region">
+                <span>地域</span>
+                <select value={regionValue} onChange={(event) => applyRegion(event.target.value)} aria-label="地域">
+                  {!regionValue && <option value="">选择地域</option>}
+                  {regionChoices.map((region) => <option key={region} value={region}>{region}</option>)}
+                </select>
+              </label>
+            )}
+            <span className="shortcut-hint"><kbd>Ctrl</kbd><kbd>Enter</kbd> 查询</span>
+            <PreferenceControls />
+            <span className="cloud-algorithm">{provider.algorithm}</span>
+          </div>
         </header>
 
         <div className="cloud-scroll">
           <CredentialBar
             title="访问凭据"
-            hint="云 API 与对象存储共用当前会话；可粘贴 AssumeRole JSON。SK 不落盘。"
+            hint={isTianditu ? "天地图只要服务端 tk，会自动加到 Query。控制台需配出口 IP 白名单。" : isQiniu ? "七牛 AccessKey / SecretKey，本机算 Qiniu MAC。先列举空间，再单击名称填入 bucket。" : isEzviz ? "萤石用开放平台 AppKey / AppSecret。查询设备前会自动换 AccessToken。" : "云 API 与对象存储共用当前会话；可粘贴 AssumeRole JSON。SK 不落盘。"}
+            idLabel={isTianditu ? "tk" : isEzviz ? "AppKey" : "AccessKey ID"}
+            keyLabel={isTianditu ? "Secret（天地图不用）" : isEzviz ? "AppSecret" : "AccessKey Secret"}
+            tokenLabel={isEzviz ? "AccessToken" : "STS Security Token"}
+            secretOptional={isTianditu}
             onNotice={setNotice}
           />
 
-          <section className="cloud-panel request-panel">
+          <section className={`cloud-panel request-panel ${requestOpen ? "" : "collapsed"}`}>
             <div className="cloud-panel-heading">
               <TerminalSquare size={16} />
-              <div><strong>签名请求</strong><span>Endpoint 仅允许匹配厂商官方 HTTPS 域名</span></div>
-              <div className="cloud-preset-select select-wrap">
-                <select value={selectedPreset.id} onChange={(event) => applyPreset(findPreset(event.target.value))} aria-label="选择云 API 模板">
-                  {providerGroups.map((group) => (
-                    <optgroup key={group.provider} label={group.meta.name}>
-                      {group.presets.map((preset) => (
-                        <option key={preset.id} value={preset.id}>{preset.product} · {preset.label}</option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select><ChevronDown size={14} />
+              <div>
+                <strong>查询</strong>
+                <span>左侧选接口，改 Query / Endpoint 时再展开</span>
               </div>
+              <button className="button secondary" onClick={() => setRequestOpen((current) => !current)}>
+                {requestOpen ? "收起参数" : "请求参数"}
+              </button>
             </div>
 
             <div className="cloud-endpoint-line">
               <select value={form.method} onChange={(event) => update("method", event.target.value)} aria-label="请求方法"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
               <input value={form.endpoint} onChange={(event) => update("endpoint", event.target.value)} spellCheck={false} aria-label="Endpoint" />
-              {requesting ? (
-                <button className="button danger" onClick={cancelRequest}><Ban size={15} />取消</button>
-              ) : (
-                <button
-                  className="button primary"
-                  onClick={() => void sendRequest()}
-                  disabled={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim()}
-                  title={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim() ? "先填写 AccessKey ID 和 Secret" : undefined}
-                >
-                  <Send size={15} />签名并发送
-                </button>
-              )}
+              <div className="cloud-send-actions">
+                {requesting ? (
+                  <button className="button danger" onClick={cancelRequest}><Ban size={15} />取消</button>
+                ) : (
+                  <>
+                    <button
+                      className="button secondary"
+                      onClick={() => void enumerateAccess()}
+                      disabled={!canSign}
+                      title={canSign ? "探测当前厂商只读模板，不是完整 IAM" : "先填写 AccessKey ID 和 Secret"}
+                    >
+                      <ListChecks size={15} />探测权限
+                    </button>
+                    <button
+                      className="button primary"
+                      onClick={() => void sendRequest()}
+                      disabled={!canSign}
+                      title={!canSign ? "先填写 AccessKey ID 和 Secret" : undefined}
+                    >
+                      <Send size={15} />查询
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
 
             <div className="cloud-fields request-meta-fields">
-              <label><span>Provider</span><select value={form.provider} onChange={(event) => update("provider", event.target.value as CloudProvider)}><option value="alibabaAcs3">阿里云 ACS3</option><option value="tencentTc3">腾讯云 TC3</option><option value="huaweiSdkHmac">华为云 SDK-HMAC</option><option value="volcengineHmac">火山引擎 HMAC</option><option value="baiduBceV1">百度智能云 BCE V1</option></select></label>
+              <label><span>Provider</span><select value={form.provider} onChange={(event) => update("provider", event.target.value as CloudProvider)}><option value="alibabaAcs3">阿里云 ACS3</option><option value="tencentTc3">腾讯云 TC3</option><option value="huaweiSdkHmac">华为云 SDK-HMAC</option><option value="volcengineHmac">火山引擎 HMAC</option><option value="baiduBceV1">百度智能云 BCE V1</option><option value="ezvizLapp">萤石云 LAPP</option><option value="tiandituTk">天地图 tk</option><option value="qiniuMac">七牛云 MAC</option></select></label>
               <label><span>Service</span><input value={form.service} onChange={(event) => update("service", event.target.value)} spellCheck={false} disabled={!usesService} placeholder={usesService ? "服务代码" : "当前协议不使用"} /></label>
               <label><span>Action</span><input value={form.action} onChange={(event) => update("action", event.target.value)} spellCheck={false} disabled={!usesActionVersion} placeholder={usesActionVersion ? "接口操作" : "由 Endpoint path 表示"} /></label>
               <label><span>Version</span><input value={form.version} onChange={(event) => update("version", event.target.value)} spellCheck={false} disabled={!usesActionVersion} placeholder={usesActionVersion ? "API 版本" : "当前协议不使用"} /></label>
-              <label><span>Region</span><input value={form.region} onChange={(event) => update("region", event.target.value)} spellCheck={false} disabled={!usesRegion} placeholder={usesRegion ? "地域代码" : "由 Endpoint 表示"} /></label>
+              <label><span>Region</span><input value={regionValue} onChange={(event) => applyRegion(event.target.value)} spellCheck={false} disabled={!showRegion} placeholder={showRegion ? "地域代码" : "由 Endpoint 表示"} /></label>
             </div>
 
             <div className="cloud-editors">
@@ -399,12 +604,25 @@ export function CloudConsole({
             </div>
           </section>
 
-          {error && <div className={`error-banner cloud-error ${error.code === "cancelled" ? "neutral" : ""}`} role="alert"><AlertCircle size={17} /><div><strong>云 API 操作失败</strong><span>{error.message}</span></div><button className="icon-button small" onClick={() => setError(null)}><X size={14} /></button></div>}
+          {error && (() => {
+            const failure = explainCloudFailure(error);
+            return (
+              <div className={`error-banner cloud-error ${failure.kind === "cancelled" ? "neutral" : ""}`} role="alert">
+                <AlertCircle size={17} />
+                <div>
+                  <strong>{failure.title}</strong>
+                  <span>{failure.hint}</span>
+                </div>
+                <button className="icon-button small" onClick={() => setError(null)}><X size={14} /></button>
+              </div>
+            );
+          })()}
 
           <section className="cloud-panel cloud-result-panel">
             <div className="tabs-toolbar">
               <div className="tabs" role="tablist">
                 <button className={resultTab === "body" ? "active" : ""} onClick={() => setResultTab("body")}><Code2 size={15} />结果</button>
+                <button className={resultTab === "access" ? "active" : ""} onClick={() => setResultTab("access")}><ListChecks size={15} />权限 {probes.length ? <small>{probes.filter((item) => item.status === "ok" || item.status === "empty").length}/{probes.length}</small> : null}</button>
                 <button className={resultTab === "headers" ? "active" : ""} onClick={() => setResultTab("headers")}><SlidersHorizontal size={15} />响应头 {response && <small>{response.headers.length}</small>}</button>
                 <button className={resultTab === "signature" ? "active" : ""} onClick={() => setResultTab("signature")}><LockKeyhole size={15} />签名诊断</button>
                 <button className={resultTab === "history" ? "active" : ""} onClick={() => setResultTab("history")}><Activity size={15} />历史 {history.length ? <small>{history.length}</small> : null}</button>
@@ -412,7 +630,8 @@ export function CloudConsole({
               {response && resultTab !== "history" && <div className="response-meta"><span className={`status-pill ${statusTone(response.status)}`}>{response.status} {response.statusText}</span><span><Clock3 size={13} />{response.elapsedMs} ms</span></div>}
             </div>
             <div className="cloud-result-content">
-              {requesting ? <div className="response-empty"><LoaderCircle className="spin" size={24} /><strong>正在等待云服务响应</strong><span>按 Esc 可取消</span></div>
+              {resultTab === "access" ? <AccessProbeView probes={probes} probing={probing} onOpen={(id) => applyPreset(findPreset(id))} />
+                : requesting ? <div className="response-empty"><LoaderCircle className="spin" size={24} /><strong>正在等待云服务响应</strong><span>按 Esc 可取消</span></div>
                 : resultTab === "history" ? history.length ? <div className="history-list">
                   {history.map((entry) => (
                     <button
@@ -446,8 +665,8 @@ export function CloudConsole({
                   {[["Canonical Request", signature.canonicalRequest], ["String to Sign", signature.stringToSign], ["Authorization", signature.authorization]].map(([label, value]) => <section key={label}><header><strong>{label}</strong><button className="icon-button small" onClick={() => void copy(value, `${label} 已复制`)}><Copy size={14} /></button></header><pre><code>{value}</code></pre></section>)}
                 </div> : <div className="response-empty"><FileKey2 size={24} /><strong>还没有签名诊断</strong><span>点击“只生成签名”不会发送网络请求</span></div>
                 : resultTab === "headers" ? response ? <div className="headers-table">{response.headers.map((header, index) => <div className="header-row" key={`${header.name}-${index}`}><span>{header.name}</span><code>{header.value}</code></div>)}</div> : <div className="response-empty"><Network size={24} /><strong>还没有响应头</strong></div>
-                : response ? <CloudResultView body={response.body} kind={form.resultKind} requestUrl={response.url} onCopy={copy} />
-                : <div className="response-empty"><Play size={24} /><strong>准备就绪</strong><span>填入 AK/SK 或整段 STS JSON 后发送；也可先只生成签名</span></div>}
+                : response ? <CloudResultView body={response.body} kind={form.resultKind} requestUrl={response.url} httpStatus={response.status} onCopy={copy} onUseValue={isQiniu ? useQiniuResultValue : undefined} />
+                : <div className="response-empty"><Play size={24} /><strong>{canSign ? "还没有结果" : "先填入凭据"}</strong><span>{canSign ? "点探测权限看这把钥匙能查哪些只读接口，或直接查询。" : "粘贴 AK/SK 或 STS JSON 后点查询。"}</span></div>}
             </div>
           </section>
         </div>

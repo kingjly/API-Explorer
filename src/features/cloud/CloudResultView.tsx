@@ -1,5 +1,6 @@
 import { Braces, Copy, Table2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { explainCloudFailure } from "../../lib/explainCloudFailure";
 import { formatJson, parseCloudResult, statusToneClass } from "./parseCloudResult";
 import type { CloudResultKind } from "./presets";
 
@@ -7,12 +8,16 @@ export function CloudResultView({
   body,
   kind,
   requestUrl,
+  httpStatus,
   onCopy,
+  onUseValue,
 }: {
   body: string;
   kind: CloudResultKind;
   requestUrl?: string;
+  httpStatus?: number;
   onCopy: (value: string, message: string) => void;
+  onUseValue?: (column: string, value: string) => void;
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const parsed = useMemo(() => parseCloudResult(body, kind), [body, kind]);
@@ -22,6 +27,17 @@ export function CloudResultView({
     setShowRaw(false);
   }, [body, kind]);
 
+  const failure = useMemo(
+    () => (parsed.error || (httpStatus && httpStatus >= 400)
+      ? explainCloudFailure({
+        code: parsed.error?.code,
+        message: parsed.error?.message,
+        body,
+        httpStatus,
+      })
+      : null),
+    [body, httpStatus, parsed.error],
+  );
   const visibleColumns = parsed.columns.filter((column) => parsed.rows.some((row) => row[column.key]));
   const tableText = useMemo(() => {
     if (visibleColumns.length === 0 || parsed.rows.length === 0) return pretty;
@@ -35,7 +51,7 @@ export function CloudResultView({
       <div className="cloud-result-toolbar">
         <strong>{showRaw || !parsed.parsed ? "原始 JSON" : parsed.title}</strong>
         {parsed.rows.length > 0 && !showRaw && <small>{parsed.rows.length} 条</small>}
-        {parsed.error && !showRaw && <small className="cloud-result-error-flag">{parsed.error.code}</small>}
+        {failure && !showRaw && <small className="cloud-result-error-flag">{parsed.error?.code || failure.kind}</small>}
         <div className="cloud-result-toolbar-actions">
           {parsed.parsed && (
             <button className="button secondary" onClick={() => setShowRaw((current) => !current)}>
@@ -59,17 +75,20 @@ export function CloudResultView({
         </div>
       )}
 
+      {failure && (
+        <div className={`cloud-result-error ${failure.kind}`} role="status">
+          <strong>{failure.title}</strong>
+          <span>{failure.hint}</span>
+          {(parsed.error?.code || parsed.error?.message) && (
+            <small>{[parsed.error.code, parsed.error.message].filter(Boolean).join(" · ")}</small>
+          )}
+        </div>
+      )}
+
       {showRaw || !parsed.parsed ? (
         <pre className="response-body"><code>{pretty}</code></pre>
       ) : (
         <>
-          {parsed.error && (
-            <div className="cloud-result-error" role="status">
-              <strong>{parsed.error.code}</strong>
-              <span>{parsed.error.message || "云接口返回业务错误。可切换原始 JSON 核对完整响应。"}</span>
-            </div>
-          )}
-
           {parsed.summary.length > 0 && (
             <dl className="cloud-result-summary">
               {parsed.summary.map((item) => (
@@ -107,8 +126,12 @@ export function CloudResultView({
                         return (
                           <td
                             key={column.key}
-                            title={value ? `${value}（单击复制）` : undefined}
-                            onClick={() => { if (value) void onCopy(value, `${column.label} 已复制`); }}
+                            title={value ? (onUseValue && (column.key === "name" || column.key === "region") ? `${value}（单击填入 Query）` : `${value}（单击复制）`) : undefined}
+                            onClick={() => {
+                              if (!value) return;
+                              if (onUseValue && (column.key === "name" || column.key === "region")) onUseValue(column.key, value);
+                              else void onCopy(value, `${column.label} 已复制`);
+                            }}
                           >
                             {isStatus && value ? (
                               <span className={`cloud-state ${statusToneClass(value)}`}>{value}</span>

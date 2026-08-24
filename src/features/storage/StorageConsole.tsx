@@ -29,7 +29,8 @@ import { CredentialBar } from "../../components/CredentialBar";
 import { PreferenceControls } from "../../components/PreferenceControls";
 import { WorkspaceSwitch, type WorkspaceMode } from "../../components/WorkspaceSwitch";
 import { api, normalizeError } from "../../lib/ipc";
-import { describeCredentialMode, useSessionCredentials } from "../../lib/sessionCredentials";
+import { explainCloudFailure } from "../../lib/explainCloudFailure";
+import { describeCredentialMode, expirationStatus, useSessionCredentials } from "../../lib/sessionCredentials";
 import { patchWorkspaceMemory, readWorkspaceMemory } from "../../lib/workspaceMemory";
 import type {
   CommandError,
@@ -89,6 +90,15 @@ const PROVIDERS: Record<StorageProvider, ProviderMeta> = {
     bucket: "examplebucket",
     description: "BCE V1 · JSON API",
   },
+  qiniuKodo: {
+    name: "七牛云对象存储 Kodo",
+    shortName: "七牛云 Kodo",
+    algorithm: "Qiniu MAC / UpToken",
+    domain: "qiniuapi.com",
+    region: "z0",
+    bucket: "examplebucket",
+    description: "表单直传 · 源站下载",
+  },
 };
 
 const OPERATIONS: Array<{
@@ -120,7 +130,10 @@ function formatBody(body: string) {
   }
 }
 
-function operationMethod(operation: StorageOperation) {
+function operationMethod(operation: StorageOperation, providerId: StorageProvider) {
+  if (providerId === "qiniuKodo" && (operation === "uploadObject" || operation === "presignPut")) {
+    return "POST";
+  }
   return operation === "uploadObject" || operation === "presignPut" ? "PUT" : "GET";
 }
 
@@ -175,6 +188,7 @@ export function StorageConsole({
   const isUpload = operation === "uploadObject";
   const isDownload = operation === "downloadObject";
   const isPresign = operation === "presignGet" || operation === "presignPut";
+  const isQiniu = providerId === "qiniuKodo";
 
   useEffect(() => {
     if (!notice) return;
@@ -227,6 +241,10 @@ export function StorageConsole({
 
   const run = useCallback(async () => {
     if (requesting) return;
+    if (expirationStatus(credentials.expiration).kind === "expired") {
+      setError({ code: "expired", message: "临时凭据已过期，请重新粘贴 STS JSON。" });
+      return;
+    }
     const requestId = crypto.randomUUID();
     setRequesting(true);
     setActiveRequestId(requestId);
@@ -239,11 +257,11 @@ export function StorageConsole({
       setHistory((current) => [{
         id: requestId,
         label: `${provider.shortName} · ${operationMeta.label}`,
-        method: operationMethod(operation),
+        method: operationMethod(operation, providerId),
         timestamp: new Date(),
         response: result,
       }, ...current].slice(0, 20));
-      if (result.presignedUrl) setNotice("预签名 URL 已在本机生成，未发送网络请求");
+      if (result.presignedUrl) setNotice(isQiniu && operation === "presignPut" ? "七牛上传凭证已在本机生成，未发送网络请求" : "预签名 URL 已在本机生成，未发送网络请求");
       if (result.savedPath) setNotice("对象已完整写入本地文件");
     } catch (reason) {
       const commandError = normalizeError(reason);
@@ -251,7 +269,7 @@ export function StorageConsole({
       setHistory((current) => [{
         id: requestId,
         label: `${provider.shortName} · ${operationMeta.label}`,
-        method: operationMethod(operation),
+        method: operationMethod(operation, providerId),
         timestamp: new Date(),
         error: commandError,
       }, ...current].slice(0, 20));
@@ -259,7 +277,7 @@ export function StorageConsole({
       setRequesting(false);
       setActiveRequestId(null);
     }
-  }, [buildRequest, operation, operationMeta.label, provider.shortName, requesting]);
+  }, [buildRequest, credentials.expiration, isQiniu, operation, operationMeta.label, provider.shortName, providerId, requesting]);
 
   const preview = useCallback(async () => {
     setError(null);
@@ -354,7 +372,7 @@ export function StorageConsole({
         <div className="cloud-scroll">
           <CredentialBar
             title="访问凭据"
-            hint="与云 AK/SK 共用当前会话。可粘贴 STS JSON；SK 不落盘。"
+            hint={isQiniu ? "七牛 AccessKey / SecretKey，与云工作区共用当前会话。SK 不落盘。" : "与云 AK/SK 共用当前会话。可粘贴 STS JSON；SK 不落盘。"}
             idLabel="AccessKey ID / SecretId"
             keyLabel="AccessKey Secret / SecretKey"
             onNotice={setNotice}
@@ -379,8 +397,8 @@ export function StorageConsole({
             </div>
 
             <div className="cloud-fields storage-resource-fields">
-              <label><span>Provider</span><select value={providerId} onChange={(event) => chooseProvider(event.target.value as StorageProvider)}><option value="alibabaOss">阿里云 OSS</option><option value="tencentCos">腾讯云 COS</option><option value="baiduBos">百度智能云 BOS</option></select></label>
-              <label><span>Region</span><input value={region} onChange={(event) => { setRegion(event.target.value); patchWorkspaceMemory({ storageRegion: event.target.value }); }} spellCheck={false} /></label>
+              <label><span>Provider</span><select value={providerId} onChange={(event) => chooseProvider(event.target.value as StorageProvider)}><option value="alibabaOss">阿里云 OSS</option><option value="tencentCos">腾讯云 COS</option><option value="baiduBos">百度智能云 BOS</option><option value="qiniuKodo">七牛云 Kodo</option></select></label>
+              <label><span>{isQiniu ? "机房" : "Region"}</span><input value={region} onChange={(event) => { setRegion(event.target.value); patchWorkspaceMemory({ storageRegion: event.target.value }); }} spellCheck={false} placeholder={isQiniu ? "z0 / z1 / z2 / na0 / as0" : undefined} /></label>
               <label><span>Bucket</span><input value={bucket} onChange={(event) => { setBucket(event.target.value); patchWorkspaceMemory({ storageBucket: event.target.value }); }} disabled={!needsBucket} spellCheck={false} placeholder={needsBucket ? "bucket-name" : "桶列表不需要"} /></label>
               <label className="storage-object-key"><span>Object Key</span><input value={objectKey} onChange={(event) => { setObjectKey(event.target.value); patchWorkspaceMemory({ storageObjectKey: event.target.value }); }} disabled={!needsObject} spellCheck={false} placeholder={needsObject ? "folder/example.txt" : "当前操作不需要"} /></label>
             </div>
@@ -418,21 +436,35 @@ export function StorageConsole({
             )}
 
             <div className="storage-runbar">
-              <div><code>{operationMethod(operation)}</code><span>{provider.domain} 官方 HTTPS Endpoint 由 Rust 自动生成</span></div>
+              <div><code>{operationMethod(operation, providerId)}</code><span>{provider.domain} 官方 HTTPS Endpoint 由 Rust 自动生成</span></div>
               {requesting ? <button className="button danger" onClick={() => void cancel()}><Ban size={15} />取消</button>
                 : <button
                     className={`button ${isUpload ? "warning" : "primary"}`}
                     onClick={() => void run()}
                     disabled={(isUpload && !overwriteConfirmed) || !credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim()}
                     title={!credentials.accessKeyId.trim() || !credentials.accessKeySecret.trim() ? "先填写 AccessKey ID 和 Secret" : undefined}
-                  >{isPresign ? <Link2 size={15} /> : isUpload ? <Upload size={15} /> : isDownload ? <Download size={15} /> : <Play size={15} />}{isPresign ? "生成预签名 URL" : isUpload ? "确认并上传" : isDownload ? "下载到本地" : "签名并查询"}</button>}
+                  >{isPresign ? <Link2 size={15} /> : isUpload ? <Upload size={15} /> : isDownload ? <Download size={15} /> : <Play size={15} />}{isPresign ? (isQiniu && operation === "presignPut" ? "生成上传凭证" : "生成预签名 URL") : isUpload ? "确认并上传" : isDownload ? "下载到本地" : "签名并查询"}</button>}
             </div>
           </section>
 
           {allowInvalidCertificates && !isPresign && <div className="inline-warning storage-warning"><ShieldAlert size={14} />TLS 证书校验已关闭，只应在受信任的代理测试环境中使用。</div>}
           {providerId === "baiduBos" && isPresign && credentials.securityToken && <div className="inline-warning storage-warning"><ShieldAlert size={14} />BOS 官方要求 STS 预签名调用方另带 Token 请求头，本工具会拒绝生成不可直接使用的链接。</div>}
+          {isQiniu && operation === "presignPut" && <div className="inline-warning storage-warning"><ShieldAlert size={14} />七牛没有可直接 PUT 的预签名 URL。这里生成的是 UpToken，POST 到对应机房的 upload.qiniup.com。</div>}
+          {isQiniu && (operation === "downloadObject" || operation === "presignGet") && <div className="inline-warning storage-warning"><ShieldAlert size={14} />下载走源站 IO（iovip），不是 CDN 绑定域名。私有空间会带下载凭证。</div>}
 
-          {error && <div className={`error-banner cloud-error ${error.code === "cancelled" ? "neutral" : ""}`} role="alert"><AlertCircle size={17} /><div><strong>{error.code === "cancelled" ? "操作已停止" : "对象存储操作失败"}</strong><span>{error.message}</span></div><button className="icon-button small" onClick={() => setError(null)} aria-label="关闭错误"><X size={14} /></button></div>}
+          {error && (() => {
+            const failure = explainCloudFailure(error);
+            return (
+              <div className={`error-banner cloud-error ${failure.kind === "cancelled" ? "neutral" : ""}`} role="alert">
+                <AlertCircle size={17} />
+                <div>
+                  <strong>{failure.title}</strong>
+                  <span>{failure.hint}</span>
+                </div>
+                <button className="icon-button small" onClick={() => setError(null)} aria-label="关闭错误"><X size={14} /></button>
+              </div>
+            );
+          })()}
 
           <section className="cloud-panel cloud-result-panel storage-result-panel">
             <div className="tabs-toolbar">
@@ -480,7 +512,7 @@ export function StorageConsole({
                 </div> : <div className="response-empty"><FileKey2 size={24} /><strong>还没有签名诊断</strong><span>可以先生成签名而不发送网络请求</span></div>
                 : resultTab === "headers" ? response ? <div className="headers-table">{response.headers.map((header, index) => <div className="header-row" key={`${header.name}-${index}`}><span>{header.name}</span><code>{header.value}</code></div>)}</div> : <div className="response-empty"><Network size={24} /><strong>还没有响应头</strong></div>
                 : response ? <div className="storage-result-body">
-                  {response.presignedUrl && <section className="presigned-output"><div><Link2 size={16} /><strong>预签名 URL</strong><span>请仅分享给需要临时访问该对象的可信对象</span></div><code>{response.presignedUrl}</code><button className="button secondary" onClick={() => void copy(response.presignedUrl ?? "", "预签名 URL 已复制")}><Copy size={14} />复制链接</button></section>}
+                  {response.presignedUrl && <section className="presigned-output"><div><Link2 size={16} /><strong>{isQiniu && operation === "presignPut" ? "上传凭证 UpToken" : "预签名 URL"}</strong><span>{isQiniu && operation === "presignPut" ? "这是上传凭证，不是可直接打开的 URL" : "请仅分享给需要临时访问该对象的可信对象"}</span></div><code>{response.presignedUrl}</code><button className="button secondary" onClick={() => void copy(response.presignedUrl ?? "", isQiniu && operation === "presignPut" ? "上传凭证已复制" : "预签名 URL 已复制")}><Copy size={14} />{isQiniu && operation === "presignPut" ? "复制凭证" : "复制链接"}</button></section>}
                   {response.savedPath && <div className="saved-path"><Check size={15} /><span><strong>已保存到</strong><code>{response.savedPath}</code></span></div>}
                   <pre className="response-body"><code>{formatBody(response.body)}</code></pre>
                 </div> : <div className="response-empty"><HardDrive size={24} /><strong>对象存储工作区已就绪</strong><span>列表操作是只读；预签名不会发送网络请求</span></div>}

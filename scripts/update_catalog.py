@@ -123,6 +123,11 @@ def apply(database: Path, catalog_path: Path, create_backup: bool) -> None:
     new_functions = catalog.get("newFunctions", [])
     new_function_ids = [int(record["id"]) for record in new_functions]
     application_ids = [int(record["id"]) for record in catalog["applications"]]
+    removed_application_ids = {
+        int(value) for value in catalog.get("removedApplications", [])
+    }
+    removed_group_ids = {int(value) for value in catalog.get("removedGroups", [])}
+    removed_function_ids = {int(value) for value in catalog.get("removedFunctions", [])}
     all_catalog_function_ids = function_ids + new_function_ids
     if len(all_catalog_function_ids) != len(set(all_catalog_function_ids)):
         raise RuntimeError("catalog contains duplicate function IDs")
@@ -176,7 +181,10 @@ def apply(database: Path, catalog_path: Path, create_backup: bool) -> None:
         patch_function_ids = set(function_ids)
         missing_patch_ids = patch_function_ids - database_function_ids
         unexpected_ids = (
-            database_function_ids - patch_function_ids - set(new_function_ids)
+            database_function_ids
+            - patch_function_ids
+            - set(new_function_ids)
+            - removed_function_ids
         )
         if missing_patch_ids or unexpected_ids:
             raise RuntimeError(
@@ -275,6 +283,37 @@ def apply(database: Path, catalog_path: Path, create_backup: bool) -> None:
                     f'VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}',
                     [values[column] for column in columns],
                 )
+            if removed_function_ids:
+                connection.execute(
+                    f'DELETE FROM function WHERE id IN ({",".join("?" for _ in removed_function_ids)})',
+                    sorted(removed_function_ids),
+                )
+            if removed_group_ids:
+                connection.execute(
+                    f'DELETE FROM function WHERE group_id IN ({",".join("?" for _ in removed_group_ids)})',
+                    sorted(removed_group_ids),
+                )
+                connection.execute(
+                    f'DELETE FROM "group" WHERE id IN ({",".join("?" for _ in removed_group_ids)})',
+                    sorted(removed_group_ids),
+                )
+            if removed_application_ids:
+                connection.execute(
+                    f'''
+                    DELETE FROM function WHERE group_id IN (
+                        SELECT id FROM "group" WHERE app_id IN ({",".join("?" for _ in removed_application_ids)})
+                    )
+                    ''',
+                    sorted(removed_application_ids),
+                )
+                connection.execute(
+                    f'DELETE FROM "group" WHERE app_id IN ({",".join("?" for _ in removed_application_ids)})',
+                    sorted(removed_application_ids),
+                )
+                connection.execute(
+                    f'DELETE FROM application WHERE id IN ({",".join("?" for _ in removed_application_ids)})',
+                    sorted(removed_application_ids),
+                )
             for key, value in (
                 ("catalog_version", catalog["version"]),
                 ("verified_at", catalog["verifiedAt"]),
@@ -310,7 +349,9 @@ def apply(database: Path, catalog_path: Path, create_backup: bool) -> None:
             final_group_ids = {
                 int(row[0]) for row in connection.execute('SELECT id FROM "group"')
             }
-            expected_final_group_ids = database_group_ids | set(new_group_ids)
+            expected_final_group_ids = (
+                database_group_ids | set(new_group_ids)
+            ) - removed_group_ids
             if final_group_ids != expected_final_group_ids:
                 raise RuntimeError(
                     "post-migration group ID mismatch: "

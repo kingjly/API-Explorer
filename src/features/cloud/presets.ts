@@ -15,7 +15,16 @@ export type CloudResultKind =
   | "loadBalancerList"
   | "diskList"
   | "projectList"
-  | "eipList";
+  | "eipList"
+  | "deviceList"
+  | "cameraList"
+  | "liveList"
+  | "geoResult"
+  | "poiList"
+  | "bucketNameList"
+  | "bucketInfo"
+  | "uploadRegion"
+  | "objectList";
 
 export interface CloudPreset {
   id: string;
@@ -42,6 +51,9 @@ export const PROVIDER_ORDER: CloudProvider[] = [
   "huaweiSdkHmac",
   "volcengineHmac",
   "baiduBceV1",
+  "ezvizLapp",
+  "tiandituTk",
+  "qiniuMac",
 ];
 
 export const PROVIDERS: Record<CloudProvider, { name: string; algorithm: string; domain: string }> = {
@@ -50,6 +62,9 @@ export const PROVIDERS: Record<CloudProvider, { name: string; algorithm: string;
   huaweiSdkHmac: { name: "华为云", algorithm: "SDK-HMAC", domain: "myhuaweicloud.com" },
   volcengineHmac: { name: "火山引擎", algorithm: "HMAC-SHA256", domain: "volcengineapi.com" },
   baiduBceV1: { name: "百度智能云", algorithm: "BCE V1", domain: "baidubce.com" },
+  ezvizLapp: { name: "萤石云", algorithm: "LAPP Form", domain: "open.ys7.com" },
+  tiandituTk: { name: "天地图", algorithm: "tk", domain: "api.tianditu.gov.cn" },
+  qiniuMac: { name: "七牛云", algorithm: "Qiniu MAC", domain: "qiniuapi.com" },
 };
 
 const JSON_UTF8 = "application/json; charset=utf-8";
@@ -208,6 +223,91 @@ function bce(
   };
 }
 
+function ezviz(
+  id: string,
+  product: string,
+  label: string,
+  path: string,
+  resultKind: CloudResultKind,
+  description: string,
+  body = "pageStart=0&pageSize=10",
+): CloudPreset {
+  return {
+    id,
+    product,
+    label,
+    provider: "ezvizLapp",
+    method: "POST",
+    endpoint: `https://open.ys7.com${path}`,
+    service: "",
+    action: id.replace("ezviz-", "").replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase()),
+    version: "",
+    region: "",
+    query: "",
+    body,
+    contentType: "application/x-www-form-urlencoded",
+    description,
+    resultKind,
+  };
+}
+
+function tdt(
+  id: string,
+  product: string,
+  label: string,
+  path: string,
+  query: string,
+  resultKind: CloudResultKind,
+  description: string,
+): CloudPreset {
+  return {
+    id,
+    product,
+    label,
+    provider: "tiandituTk",
+    method: "GET",
+    endpoint: `https://api.tianditu.gov.cn${path}`,
+    service: "",
+    action: "",
+    version: "",
+    region: "",
+    query,
+    body: "",
+    contentType: "application/json",
+    description,
+    resultKind,
+  };
+}
+
+function qiniu(
+  id: string,
+  product: string,
+  label: string,
+  endpoint: string,
+  query: string,
+  resultKind: CloudResultKind,
+  description: string,
+  action = "",
+): CloudPreset {
+  return {
+    id,
+    product,
+    label,
+    provider: "qiniuMac",
+    method: "GET",
+    endpoint,
+    service: "",
+    action,
+    version: "",
+    region: "",
+    query,
+    body: "",
+    contentType: "application/x-www-form-urlencoded",
+    description,
+    resultKind,
+  };
+}
+
 export const PRESETS: CloudPreset[] = [
   acs("aliyun-sts-identity", "STS", "校验身份", "GetCallerIdentity", "2015-04-01", "sts.aliyuncs.com", "", "identity", "确认当前 AK 对应的账号与 ARN"),
   acs("aliyun-ecs-regions", "ECS", "查询地域", "DescribeRegions", "2014-05-26", "ecs.aliyuncs.com", "", "regionList", "列出账号可访问的 ECS 地域"),
@@ -267,6 +367,29 @@ export const PRESETS: CloudPreset[] = [
   bce("baidu-vpc-eip", "EIP", "查询弹性公网 IP", "https://eip.bj.baidubce.com/v1/eip", "eipList", "EIP 列表", "maxKeys=10"),
   bce("baidu-rds-list", "RDS", "查询数据库实例", "https://rds.bj.baidubce.com/v1/instance", "rdsList", "RDS 实例", "maxKeys=10"),
   bce("baidu-blb-list", "BLB", "查询负载均衡", "https://blb.bj.baidubce.com/v1/blb", "loadBalancerList", "负载均衡实例", "maxKeys=10"),
+
+  ezviz("ezviz-token-get", "账号", "获取 Token", "/api/lapp/token/get", "identity", "用 AppKey/AppSecret 换 AccessToken，有效期约 7 天", ""),
+  ezviz("ezviz-device-list", "设备", "查询设备", "/api/lapp/device/list", "deviceList", "当前账号下的设备列表"),
+  ezviz("ezviz-camera-list", "设备", "查询摄像头", "/api/lapp/camera/list", "cameraList", "监控点 / 通道列表"),
+  ezviz("ezviz-device-info", "设备", "查询设备信息", "/api/lapp/device/info", "deviceList", "按序列号查单台设备", "deviceSerial="),
+  ezviz("ezviz-device-status-get", "设备", "查询设备状态", "/api/lapp/device/status/get", "deviceList", "按序列号和通道查在线状态", "deviceSerial=&channel=1"),
+  ezviz("ezviz-device-camera-list", "设备", "查询设备通道", "/api/lapp/device/camera/list", "cameraList", "指定设备的通道列表", "deviceSerial="),
+  ezviz("ezviz-device-capacity", "设备", "查询设备能力", "/api/lapp/device/capacity", "deviceList", "设备能力集", "deviceSerial="),
+  ezviz("ezviz-live-video-list", "直播", "查询直播列表", "/api/lapp/live/video/list", "liveList", "账号下已开通的直播源"),
+  ezviz("ezviz-live-address-get", "直播", "获取直播地址", "/api/lapp/v2/live/address/get", "liveList", "按设备序列号取播放地址，需填 deviceSerial", "deviceSerial=&channelNo=1&protocol=2"),
+
+  tdt("tianditu-geocode", "地理", "地址转坐标", "/geocoder", 'ds={"keyWord":"北京市海淀区莲花池西路28号"}', "geoResult", "地理编码，tk 由本机自动追加"),
+  tdt("tianditu-regeocode", "地理", "坐标转地址", "/geocoder", 'postStr={"lon":116.37304,"lat":39.92594,"ver":1}&type=geocode', "geoResult", "逆地理编码"),
+  tdt("tianditu-search", "检索", "关键词搜索", "/v2/search", 'postStr={"keyWord":"天安门","queryType":1,"start":0,"count":10,"level":12,"mapBound":"116.0,39.7,116.8,40.1"}&type=query', "poiList", "行政区 / POI 检索"),
+  tdt("tianditu-drive", "路径", "驾车规划", "/drive", 'postStr={"orig":"116.35506,39.92277","dest":"116.39747,39.90882"}&type=search', "geoResult", "驾车路线，返回可能是 XML/JSON"),
+
+  qiniu("qiniu-buckets", "空间", "列举空间", "https://uc.qiniuapi.com/buckets", "", "bucketNameList", "当前密钥下的 Bucket 列表"),
+  qiniu("qiniu-bucket-info", "空间", "查询空间信息", "https://uc.qiniuapi.com/v2/bucketInfo", "bucket=", "bucketInfo", "机房、私有属性和源站域名，先填 bucket"),
+  qiniu("qiniu-bucket-quota", "空间", "查询空间配额", "https://uc.qiniuapi.com/v2/bucketQuota", "bucket=", "bucketInfo", "容量和文件数配额，-1 表示不限制"),
+  qiniu("qiniu-query-region", "空间", "查询上传区域", "https://uc.qiniuapi.com/v4/query", "bucket=", "uploadRegion", "按 bucket 查上传/源站域名，ak 由本机追加", "queryRegion"),
+  qiniu("qiniu-list", "空间", "列举文件", "https://rsf.qiniuapi.com/list", "bucket=&limit=10", "objectList", "指定空间的对象列表，先填 bucket"),
+  qiniu("qiniu-stat", "空间", "查询文件信息", "https://rs.qiniu.com/stat", "bucket=&key=", "objectList", "按 bucket + key 查元数据", "stat"),
+  qiniu("qiniu-domains", "空间", "查询绑定域名", "https://api.qiniu.com/v6/domain/list", "tbl=", "bucketNameList", "空间绑定的访问域名，tbl 填 Bucket 名"),
 ];
 
 export function groupPresetsByProvider(presets: CloudPreset[]) {
@@ -290,6 +413,43 @@ export function groupPresetsByProvider(presets: CloudPreset[]) {
 
 export function findPreset(id: string) {
   return PRESETS.find((item) => item.id === id) ?? PRESETS[0];
+}
+
+export function applyRegionToPreset(preset: CloudPreset, region: string): CloudPreset {
+  if (!region) return preset;
+  return {
+    ...preset,
+    region,
+    query: /(?:^|&)RegionId=/.test(preset.query) ? replaceQueryValue(preset.query, "RegionId", region) : preset.query,
+  };
+}
+
+export function enumerationPresets(provider: CloudProvider) {
+  const rank = (item: CloudPreset) => {
+    if (item.resultKind === "identity" || item.resultKind === "bucketNameList") return 0;
+    if (item.resultKind === "projectList") return 1;
+    if (item.resultKind === "regionList") return 2;
+    return 3;
+  };
+  return PRESETS
+    .filter((item) => item.provider === provider && item.risk !== "write")
+    .sort((a, b) => rank(a) - rank(b) || a.product.localeCompare(b.product, "zh"));
+}
+
+export function needsProjectPlaceholder(preset: CloudPreset) {
+  return preset.endpoint.includes("YOUR_PROJECT_ID");
+}
+
+export const REGION_OPTIONS: Partial<Record<CloudProvider, string[]>> = {
+  alibabaAcs3: ["cn-hangzhou", "cn-shanghai", "cn-beijing", "cn-shenzhen", "cn-chengdu", "cn-hongkong"],
+  tencentTc3: ["ap-guangzhou", "ap-shanghai", "ap-beijing", "ap-chengdu", "ap-nanjing", "ap-hongkong"],
+  volcengineHmac: ["cn-beijing", "cn-shanghai", "cn-guangzhou", "cn-hongkong"],
+};
+
+export function replaceQueryValue(query: string, key: string, value: string) {
+  const pattern = new RegExp(`(^|&)${key}=[^&]*`);
+  if (pattern.test(query)) return query.replace(pattern, `$1${key}=${value}`);
+  return query ? `${query}&${key}=${value}` : `${key}=${value}`;
 }
 
 export function presetMatchesQuery(preset: CloudPreset, query: string) {

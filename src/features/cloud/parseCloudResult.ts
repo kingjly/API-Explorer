@@ -114,12 +114,22 @@ function detectError(root: unknown): ParsedCloudResult["error"] | undefined {
   const record = asRecord(root);
   if (!record) return undefined;
 
+  const status = firstText(record, ["status", "Status"]);
+  const statusMessage = firstText(record, ["msg", "Message", "message"]);
+  if (status && statusMessage && !["0", "200", "OK", "ok", "Success", "success"].includes(status)) {
+    return { code: status, message: statusMessage };
+  }
+
   const aliyunCode = firstText(record, ["Code", "code"]);
-  const aliyunMessage = firstText(record, ["Message", "message", "Msg"]);
+  const aliyunMessage = firstText(record, ["Message", "message", "Msg", "msg"]);
   if (aliyunCode && !["OK", "ok", "Success", "success", "200"].includes(aliyunCode)) {
-    if ("RequestId" in record || "requestId" in record || aliyunMessage) {
+    if ("RequestId" in record || "requestId" in record || "msg" in record || aliyunMessage) {
       return { code: aliyunCode, message: aliyunMessage };
     }
+  }
+
+  if (typeof record.error === "string" && record.error) {
+    return { code: "error", message: record.error };
   }
 
   return undefined;
@@ -136,8 +146,10 @@ function collectLists(root: unknown, paths: string[][]): unknown[] {
   for (const path of paths) {
     const value = get(root, path);
     if (value == null) continue;
-    const list = Array.isArray(value) ? value : unwrapAliyunList(value);
-    if (list.length > 0) return list;
+    if (Array.isArray(value)) return value;
+    const unwrapped = unwrapAliyunList(value);
+    if (unwrapped.length > 0) return unwrapped;
+    if (asRecord(value)) return [value];
   }
   return [];
 }
@@ -158,8 +170,9 @@ function parseMappedList(
     parsed: true,
     error: detectError(root),
     summary: summaryFrom(root, [
-      { label: "总数", paths: [["TotalCount"], ["Response", "TotalCount"], ["Result", "TotalCount"], ["Result", "Total"], ["count"], ["total_count"]] },
+      { label: "总数", paths: [["page", "total"], ["TotalCount"], ["Response", "TotalCount"], ["Result", "TotalCount"], ["Result", "Total"], ["count"], ["total_count"]] },
       { label: "RequestId", paths: [["RequestId"], ["Response", "RequestId"], ["ResponseMetadata", "RequestId"], ["requestId"], ["request_id"]] },
+      { label: "说明", paths: [["msg"], ["Message"], ["message"]] },
     ]),
     columns: columns.map(({ key, label }) => ({ key, label })),
     rows,
@@ -175,7 +188,10 @@ function parseIdentity(root: unknown): ParsedCloudResult {
       { label: "账号", paths: [["AccountId"], ["Response", "AccountId"], ["accountId"]] },
       { label: "用户 ID", paths: [["UserId"], ["Response", "UserId"], ["Response", "PrincipalId"], ["userId"]] },
       { label: "ARN", paths: [["Arn"], ["Response", "Arn"], ["arn"]] },
+      { label: "AccessToken", paths: [["data", "accessToken"], ["accessToken"]] },
+      { label: "过期时间", paths: [["data", "expireTime"], ["expireTime"]] },
       { label: "类型", paths: [["IdentityType"], ["Response", "Type"], ["Type"]] },
+      { label: "说明", paths: [["msg"], ["Message"], ["message"]] },
       { label: "RequestId", paths: [["RequestId"], ["Response", "RequestId"], ["requestId"]] },
     ]),
     columns: [],
@@ -282,7 +298,7 @@ function parseSmsSend(root: unknown): ParsedCloudResult {
 }
 
 const LIST_KIND_SPECS: Record<
-  Exclude<CloudResultKind, "instanceList" | "smsSend" | "identity">,
+  Exclude<CloudResultKind, "instanceList" | "smsSend" | "identity" | "geoResult" | "bucketNameList" | "bucketInfo" | "uploadRegion" | "objectList">,
   { title: string; listPaths: string[][]; columns: Array<{ key: string; label: string; fields: string[] }> }
 > = {
   regionList: {
@@ -411,11 +427,196 @@ const LIST_KIND_SPECS: Record<
       { key: "bandwidth", label: "带宽", fields: ["Bandwidth", "bandwidth", "InternetMaxBandwidthOut"] },
     ],
   },
+  deviceList: {
+    title: "设备",
+    listPaths: [["data"], ["Data"]],
+    columns: [
+      { key: "id", label: "序列号", fields: ["deviceSerial", "deviceId"] },
+      { key: "name", label: "名称", fields: ["deviceName", "name"] },
+      { key: "status", label: "状态", fields: ["status", "deviceStatus"] },
+      { key: "type", label: "型号", fields: ["deviceType", "model", "deviceVersion"] },
+      { key: "version", label: "版本", fields: ["deviceVersion", "version"] },
+    ],
+  },
+  cameraList: {
+    title: "摄像头",
+    listPaths: [["data"], ["Data"]],
+    columns: [
+      { key: "id", label: "序列号", fields: ["deviceSerial"] },
+      { key: "name", label: "通道", fields: ["channelName", "cameraName", "name"] },
+      { key: "channel", label: "通道号", fields: ["channelNo", "channel"] },
+      { key: "status", label: "状态", fields: ["status"] },
+      { key: "encrypt", label: "加密", fields: ["isEncrypt"] },
+    ],
+  },
+  liveList: {
+    title: "直播",
+    listPaths: [["data"], ["Data"]],
+    columns: [
+      { key: "id", label: "序列号", fields: ["deviceSerial"] },
+      { key: "name", label: "通道", fields: ["channelName", "liveName", "deviceName"] },
+      { key: "url", label: "地址", fields: ["url", "liveAddress", "hdAddress", "address"] },
+      { key: "expire", label: "过期", fields: ["expireTime", "id"] },
+      { key: "status", label: "状态", fields: ["status"] },
+    ],
+  },
+  poiList: {
+    title: "地点",
+    listPaths: [["pois"], ["list"], ["result", "pois"], ["data", "pois"]],
+    columns: [
+      { key: "name", label: "名称", fields: ["name", "hotPointID"] },
+      { key: "address", label: "地址", fields: ["address", "address_detail"] },
+      { key: "lonlat", label: "坐标", fields: ["lonlat", "lonlat"] },
+      { key: "phone", label: "电话", fields: ["phone", "tel"] },
+    ],
+  },
 };
+
+function parseGeoResult(root: unknown): ParsedCloudResult {
+  return {
+    title: "地理结果",
+    parsed: true,
+    error: detectError(root),
+    summary: summaryFrom(root, [
+      { label: "状态", paths: [["status"], ["msg"]] },
+      { label: "地址", paths: [["result", "formatted_address"], ["formatted_address"], ["msg"]] },
+      { label: "经度", paths: [["location", "lon"], ["result", "location", "lon"], ["lon"]] },
+      { label: "纬度", paths: [["location", "lat"], ["result", "location", "lat"], ["lat"]] },
+      { label: "级别", paths: [["location", "level"], ["result", "level"]] },
+    ]),
+    columns: [],
+    rows: [],
+  };
+}
+
+function parseBucketNameList(root: unknown): ParsedCloudResult {
+  const names = Array.isArray(root)
+    ? root.filter((item): item is string => typeof item === "string")
+    : collectLists(root, [["domains"], ["data"], ["items"]]).flatMap((item) => (
+      typeof item === "string" ? [item] : firstText(asRecord(item), ["name", "tbl", "domain"]) ? [firstText(asRecord(item), ["name", "tbl", "domain"])] : []
+    ));
+  return {
+    title: "空间 / 域名",
+    parsed: true,
+    error: detectError(root),
+    summary: [{ label: "数量", value: String(names.length) }],
+    columns: [{ key: "name", label: "名称" }],
+    rows: names.map((name) => ({ name })),
+  };
+}
+
+function collectHostNames(value: unknown): string[] {
+  if (typeof value === "string" && value) return [value];
+  if (Array.isArray(value)) return value.flatMap(collectHostNames);
+  const record = asRecord(value);
+  if (!record) return [];
+  return ["domains", "main", "backup", "acc", "src", "old_acc", "old_src"]
+    .flatMap((key) => collectHostNames(record[key]));
+}
+
+function quotaText(value: unknown) {
+  if (value == null || value === "") return "";
+  if (value === -1 || value === "-1") return "不限制";
+  return String(value);
+}
+
+function parseBucketInfo(root: unknown): ParsedCloudResult {
+  const record = asRecord(root);
+  const names = [
+    ...(Array.isArray(record?.domain) ? record.domain : []),
+    ...(Array.isArray(record?.domains) ? record.domains : []),
+    ...collectLists(root, [["domain"], ["domains"], ["domain", "domains"]]),
+  ].flatMap((item) => (typeof item === "string" && item ? [item] : []));
+  const privateFlag = firstText(record, ["private", "isPrivate", "protected"]);
+  const summary = [
+    { label: "空间", value: firstText(record, ["tbl", "name", "bucket", "id"]) },
+    { label: "机房", value: firstText(record, ["region", "zone", "region_tag"]) },
+    { label: "私有", value: privateFlag === "1" || privateFlag.toLowerCase() === "true" ? "是" : privateFlag === "0" || privateFlag.toLowerCase() === "false" ? "否" : privateFlag },
+    { label: "容量配额", value: quotaText(record?.size) },
+    { label: "文件数配额", value: quotaText(record?.count) },
+    { label: "源站", value: firstText(record, ["source", "host", "extranet_endpoint"]) },
+  ].filter((item) => item.value);
+  return {
+    title: summary.some((item) => item.label.includes("配额")) && !summary.some((item) => item.label === "机房") ? "空间配额" : "空间信息",
+    parsed: true,
+    error: detectError(root),
+    summary: summary.length > 0 ? summary : [{ label: "数量", value: String(names.length) }],
+    columns: [{ key: "name", label: "域名" }],
+    rows: names.map((name) => ({ name })),
+  };
+}
+
+function parseUploadRegion(root: unknown): ParsedCloudResult {
+  const hosts = collectLists(root, [["hosts"]]);
+  const rows = hosts.map((item) => {
+    const record = asRecord(item);
+    return {
+      region: firstText(record, ["region", "region_tag", "id"]),
+      up: collectHostNames(record?.up).slice(0, 4).join(", "),
+      io: collectHostNames(record?.io).slice(0, 3).join(", "),
+      rs: collectHostNames(record?.rs).join(", "),
+    };
+  }).filter((row) => row.region || row.up || row.io);
+  const first = rows[0];
+  return {
+    title: "上传区域",
+    parsed: true,
+    error: detectError(root),
+    summary: [
+      { label: "机房", value: first?.region ?? "" },
+      { label: "上传", value: first?.up ?? "" },
+      { label: "源站", value: first?.io ?? "" },
+    ].filter((item) => item.value),
+    columns: [
+      { key: "region", label: "机房" },
+      { key: "up", label: "上传" },
+      { key: "io", label: "源站" },
+      { key: "rs", label: "管理" },
+    ],
+    rows,
+  };
+}
+
+function parseObjectList(root: unknown): ParsedCloudResult {
+  const items = collectLists(root, [["items"], ["data"]]);
+  const record = asRecord(root);
+  const rows = items.length > 0
+    ? mapRows(items, (item) => ({
+      name: firstText(item, ["key", "fname", "name"]),
+      size: firstText(item, ["fsize", "size"]),
+      type: firstText(item, ["mimeType", "mime"]),
+      hash: firstText(item, ["hash", "md5"]),
+    }))
+    : record && (record.fsize != null || record.hash)
+      ? [{
+        name: firstText(record, ["key", "hash"]),
+        size: firstText(record, ["fsize"]),
+        type: firstText(record, ["mimeType"]),
+        hash: firstText(record, ["hash"]),
+      }]
+      : [];
+  return {
+    title: "对象",
+    parsed: true,
+    error: detectError(root),
+    summary: summaryFrom(root, [
+      { label: "marker", paths: [["marker"]] },
+      { label: "hash", paths: [["hash"]] },
+      { label: "大小", paths: [["fsize"]] },
+    ]),
+    columns: [
+      { key: "name", label: "Key" },
+      { key: "size", label: "大小" },
+      { key: "type", label: "类型" },
+      { key: "hash", label: "Hash" },
+    ],
+    rows,
+  };
+}
 
 function parseGeneric(root: unknown): ParsedCloudResult {
   const record = asRecord(root);
-  const nested = asRecord(get(root, ["Response"])) ?? asRecord(get(root, ["Result"])) ?? record;
+  const nested = asRecord(get(root, ["data"])) ?? asRecord(get(root, ["Response"])) ?? asRecord(get(root, ["Result"])) ?? record;
   const arrayEntry = nested
     ? Object.entries(nested).find(([, value]) => Array.isArray(value) && (value as unknown[]).some(asRecord))
     : undefined;
@@ -465,12 +666,37 @@ export function parseCloudResult(body: string, kind: CloudResultKind): ParsedClo
       return parseSmsSend(root);
     case "identity":
       return parseIdentity(root);
+    case "geoResult":
+      return parseGeoResult(root);
+    case "bucketNameList":
+      return parseBucketNameList(root);
+    case "bucketInfo":
+      return parseBucketInfo(root);
+    case "uploadRegion":
+      return parseUploadRegion(root);
+    case "objectList":
+      return parseObjectList(root);
     default: {
       const spec = LIST_KIND_SPECS[kind];
       return spec
         ? parseMappedList(root, spec.title, spec.listPaths, spec.columns)
         : parseGeneric(root);
     }
+  }
+}
+
+export function extractEzvizToken(body: string): { accessToken: string; expiration: string } | null {
+  try {
+    const root = JSON.parse(body) as unknown;
+    const token = text(pickPath(root, [["data", "accessToken"], ["accessToken"]]));
+    if (!token) return null;
+    const expire = text(pickPath(root, [["data", "expireTime"], ["expireTime"]]));
+    const expiration = /^\d+$/.test(expire)
+      ? new Date(Number(expire) < 1e12 ? Number(expire) * 1000 : Number(expire)).toISOString()
+      : expire;
+    return { accessToken: token, expiration };
+  } catch {
+    return null;
   }
 }
 

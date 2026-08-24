@@ -9,6 +9,7 @@ API Explorer 将对象存储作为独立工作区处理，不把二进制文件�
 | 阿里云 OSS | `OSS4-HMAC-SHA256` | 支持 | 支持 | 支持 | 支持 | 支持 |
 | 腾讯云 COS | XML API `q-sign-algorithm=sha1` | 支持 | 支持 | 支持 | 支持 | 支持 |
 | 百度智能云 BOS | `bce-auth-v1` | 支持 | 支持 | 支持 | 支持 | 长期 AK/SK 支持 |
+| 七牛云 Kodo | Qiniu MAC / UpToken | 支持 | 支持 | 支持（表单直传） | 支持（源站 IO） | 下载链接 / 上传凭证 |
 
 上传是单次 PutObject，最大 5 GiB。分片上传、并行上传、断点续传、批量删除和跨桶复制不在 3.5 范围内。
 
@@ -34,7 +35,7 @@ Rust Object Storage Adapter
 
 ## 安全约束
 
-- OSS Endpoint 固定在 `aliyuncs.com`，COS 固定在 `myqcloud.com`，BOS 固定在 `bcebos.com`。
+- OSS Endpoint 固定在 `aliyuncs.com`，COS 固定在 `myqcloud.com`，BOS 固定在 `bcebos.com`，七牛固定在 `qiniuapi.com` / `qiniup.com` / `qbox.me` / `qiniuio.com`。
 - Region、Bucket 经过 DNS 组件校验；Object Key 按路径段编码，`.` 与 `..` 不会成为 URL 路径归一化指令。
 - SK 不返回前端、不写数据库、不写浏览器存储；AK 在签名诊断中遮盖。
 - STS Token 在 Canonical Request 与签名诊断中脱敏。
@@ -62,3 +63,6 @@ Rust Object Storage Adapter
 - [百度智能云 BCE V1 认证字符串](https://cloud.baidu.com/doc/Reference/s/njwvz1yfu)
 - [百度智能云 BOS ListObjects](https://cloud.baidu.com/doc/BOS/s/Ekc4epj6m)
 - [百度智能云 BOS STS 访问控制](https://cloud.baidu.com/doc/BOS/s/Tjwvysda9)
+- [七牛云管理凭证 Qiniu MAC](https://developer.qiniu.com/kodo/1201/access-token)
+- [七牛云上传凭证](https://developer.qiniu.com/kodo/1208/upload-token)
+- [七牛云资源下载与私有链接](https://developer.qiniu.com/kodo/1658/get)

@@ -16,8 +16,8 @@ const EMPTY: SessionCredentials = {
 
 const ID_KEYS = ["AccessKeyId", "accessKeyId", "TmpSecretId", "tmpSecretId", "tmpAccessKeyId", "access", "Access"];
 const SECRET_KEYS = ["AccessKeySecret", "accessKeySecret", "SecretAccessKey", "TmpSecretKey", "tmpSecretKey", "secret", "Secret"];
-const TOKEN_KEYS = ["SecurityToken", "securityToken", "SessionToken", "sessionToken", "Token", "token", "securitytoken", "XSecurityToken"];
-const EXPIRY_KEYS = ["Expiration", "expiration", "ExpireAt", "expireAt", "ExpiredTime", "expiredTime", "ExpiresAt"];
+const TOKEN_KEYS = ["SecurityToken", "securityToken", "SessionToken", "sessionToken", "Token", "token", "securitytoken", "XSecurityToken", "accessToken", "AccessToken"];
+const EXPIRY_KEYS = ["Expiration", "expiration", "ExpireAt", "expireAt", "ExpiredTime", "expiredTime", "ExpiresAt", "expireTime"];
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -70,6 +70,7 @@ function collectCandidates(root: unknown): Record<string, unknown>[] {
     asRecord(record.Response)?.credentials,
     asRecord(record.Result)?.Credentials,
     asRecord(record.data)?.Credentials,
+    record.data,
     asRecord(record.AssumeRoleResponse)?.Credentials,
   ];
   return [record, ...nested.map(asRecord).filter((item): item is Record<string, unknown> => item !== null)];

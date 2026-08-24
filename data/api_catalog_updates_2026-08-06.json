@@ -1,11 +1,13 @@
 {
-  "version": "2026.08.06.3",
-  "verifiedAt": "2026-08-06",
+  "version": "2026.08.25.1",
+  "verifiedAt": "2026-08-25",
+  "removedApplications": [4],
+  "removedGroups": [8, 18],
+  "removedFunctions": [16],
   "applications": [
     { "id": 1, "idLabel": "appid", "keyLabel": "secret", "baseUrl": "https://api.weixin.qq.com" },
     { "id": 2, "idLabel": "appid", "keyLabel": "secret", "baseUrl": "https://api.weixin.qq.com" },
     { "id": 3, "idLabel": "corpid", "keyLabel": "corpsecret", "baseUrl": "https://qyapi.weixin.qq.com" },
-    { "id": 4, "idLabel": "username", "keyLabel": "password" },
     { "id": 5, "idLabel": "无需填写", "keyLabel": "无需填写" },
     { "id": 6, "idLabel": "app_id", "keyLabel": "app_secret", "baseUrl": "https://open.feishu.cn" },
     { "id": 7, "name": "钉钉（新版 API）", "idLabel": "appKey", "keyLabel": "appSecret", "baseUrl": "https://api.dingtalk.com" },
@@ -39,14 +41,6 @@
     { "id": 13, "name": "获取草稿详情", "body": "media_id=", "specStatus": "active", "specVersion": "草稿箱当前版", "docUrl": "https://developers.weixin.qq.com/doc/service/api/draftbox/draftmanage/api_getdraft.html", "documentation": "按 media_id 获取草稿详情，包括图文、图片和商品等内容。", "changeNote": "移除数据库中硬编码的历史 media_id。" },
     { "id": 14, "name": "删除草稿", "specStatus": "active", "specVersion": "草稿箱当前版", "docUrl": "https://developers.weixin.qq.com/doc/service/api/draftbox/draftmanage/api_draft_delete.html", "documentation": "按 media_id 删除指定草稿；操作不可撤销。" },
     { "id": 15, "name": "嵌套 JSON 测试（非官方 API）", "specStatus": "test-only", "specVersion": "非厂商接口", "docUrl": "", "documentation": "仅用于本地请求序列化测试，不属于微信官方接口，正式环境禁止发送。", "changeNote": "识别为项目遗留测试项；执行层已阻止向 test.com 发送请求。" },
-    {
-      "id": 16,
-      "specStatus": "unverified",
-      "specVersion": "设备固件相关",
-      "docUrl": "https://www.nsfocus.com.cn/html/2019/177_0908/24.html",
-      "changeNote": "绿盟公开站点仅提供需登记获取的二次开发资料，无法从公开官方文档确认 /api/system/status 在所有 RSAS 版本上的兼容性。",
-      "documentation": "读取绿盟 RSAS 设备系统状态。使用 Basic Authorization，请在 Token 栏填入 username:password 后执行 Base64 编码。接口路径和响应字段与具体固件版本相关，调用前应以设备配套的《二次开发接口》文档为准。"
-    },
 
     { "id": 17, "name": "小程序登录凭证校验", "query": "appid={id}&secret={secert}&js_code=&grant_type=authorization_code", "specStatus": "active", "specVersion": "小程序登录当前版", "docUrl": "https://developers.weixin.qq.com/miniprogram/dev/server/API/user-login/api_code2session.html", "documentation": "使用 wx.login 获取的临时 code 换取 openid、session_key，绑定开放平台时还可能返回 unionid；本接口不使用 access_token。" },
     { "id": 18, "name": "检验登录态", "query": "access_token={token}&openid=&signature=&sig_method=hmac_sha256", "specStatus": "active", "specVersion": "小程序登录当前版", "docUrl": "https://developers.weixin.qq.com/miniprogram/dev/server/API/user-login/api_checksessionkey.html", "documentation": "校验服务端保存的 session_key 是否仍有效。openid、signature、sig_method=hmac_sha256 均必填；signature 使用 session_key 对空字符串计算 HMAC-SHA256。", "changeNote": "补齐旧模板缺少的 openid、signature、sig_method 必填参数。" },

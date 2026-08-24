@@ -101,7 +101,10 @@ export type CloudProvider =
   | "tencentTc3"
   | "huaweiSdkHmac"
   | "volcengineHmac"
-  | "baiduBceV1";
+  | "baiduBceV1"
+  | "ezvizLapp"
+  | "tiandituTk"
+  | "qiniuMac";
 
 export interface CloudCredentials {
   accessKeyId: string;
@@ -140,7 +143,7 @@ export interface CloudResponse extends Omit<ApiResponse, "token"> {
   signature: CloudSignaturePreview;
 }
 
-export type StorageProvider = "alibabaOss" | "tencentCos" | "baiduBos";
+export type StorageProvider = "alibabaOss" | "tencentCos" | "baiduBos" | "qiniuKodo";
 
 export type StorageOperation =
   | "listBuckets"

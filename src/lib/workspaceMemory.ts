@@ -37,7 +37,7 @@ const EMPTY: WorkspaceMemory = {
   catalogFunctionId: null,
 };
 
-const STORAGE_PROVIDERS: StorageProvider[] = ["alibabaOss", "tencentCos", "baiduBos"];
+const STORAGE_PROVIDERS: StorageProvider[] = ["alibabaOss", "tencentCos", "baiduBos", "qiniuKodo"];
 const STORAGE_OPERATIONS: StorageOperation[] = [
   "listBuckets",
   "listObjects",

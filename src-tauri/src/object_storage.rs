@@ -1,4 +1,5 @@
 use crate::AppError;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -33,6 +34,7 @@ pub(crate) enum StorageProvider {
     AlibabaOss,
     TencentCos,
     BaiduBos,
+    QiniuKodo,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -257,6 +259,9 @@ async fn execute_upload(
             "简单上传限制为 5 GiB；更大的对象需要后续分片上传工作流",
         ));
     }
+    if request.provider == StorageProvider::QiniuKodo {
+        return execute_qiniu_form_upload(request, prepared, client, cancellation, source, metadata.len()).await;
+    }
     let file = tokio::fs::File::open(&source)
         .await
         .map_err(|error| AppError::new("file_error", format!("无法打开上传文件：{error}")))?;
@@ -286,6 +291,58 @@ async fn execute_upload(
         result.bytes_transferred = metadata.len();
         if result.body.trim().is_empty() {
             result.body = format!("上传完成：{} 字节", metadata.len());
+        }
+    }
+    Ok(result)
+}
+
+async fn execute_qiniu_form_upload(
+    request: &StorageRequest,
+    prepared: PreparedStorageRequest,
+    client: Client,
+    cancellation: CancellationToken,
+    source: PathBuf,
+    size: u64,
+) -> Result<StorageResponse, AppError> {
+    let token = prepared
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("UpToken "))
+        .ok_or_else(|| AppError::new("signature_error", "缺少七牛上传凭证"))?
+        .to_string();
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let file = tokio::fs::File::open(&source)
+        .await
+        .map_err(|error| AppError::new("file_error", format!("无法打开上传文件：{error}")))?;
+    let part = reqwest::multipart::Part::stream_with_length(Body::wrap_stream(ReaderStream::new(file)), size)
+        .file_name(file_name)
+        .mime_str(&effective_content_type(request))
+        .map_err(|error| AppError::new("file_error", format!("无法构造上传表单：{error}")))?;
+    let form = reqwest::multipart::Form::new()
+        .text("token", token)
+        .text(
+            "key",
+            request.object_key.trim_start_matches('/').to_string(),
+        )
+        .part("file", part);
+    let started_at = Instant::now();
+    let response = tokio::select! {
+        result = client.post(prepared.url).multipart(form).send() => result.map_err(map_request_error)?,
+        _ = cancellation.cancelled() => return Err(AppError::new("cancelled", "对象上传已取消")),
+    };
+    let mut result = response_to_text(response, started_at, prepared.signature, cancellation).await?;
+    if result
+        .status
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        result.bytes_transferred = size;
+        if result.body.trim().is_empty() {
+            result.body = format!("上传完成：{size} 字节");
         }
     }
     Ok(result)
@@ -502,6 +559,9 @@ fn prepare(request: &StorageRequest, timestamp: i64) -> Result<PreparedStorageRe
             timestamp,
             expires,
         ),
+        StorageProvider::QiniuKodo => {
+            prepare_qiniu(request, url, host, &signing_path, &query_pairs, timestamp, expires)
+        }
     }
 }
 
@@ -905,6 +965,254 @@ fn prepare_bos(
     })
 }
 
+fn prepare_qiniu(
+    request: &StorageRequest,
+    url: Url,
+    host: String,
+    signing_path: &str,
+    query_pairs: &[(String, String)],
+    timestamp: i64,
+    expires: u32,
+) -> Result<PreparedStorageRequest, AppError> {
+    match request.operation {
+        StorageOperation::ListBuckets | StorageOperation::ListObjects => {
+            prepare_qiniu_mac(request, url, host, signing_path, query_pairs, timestamp)
+        }
+        StorageOperation::UploadObject | StorageOperation::PresignPut => {
+            prepare_qiniu_upload(request, url, host, timestamp, expires)
+        }
+        StorageOperation::DownloadObject | StorageOperation::PresignGet => {
+            prepare_qiniu_download(request, signing_path, host, timestamp, expires)
+        }
+    }
+}
+
+fn prepare_qiniu_mac(
+    request: &StorageRequest,
+    url: Url,
+    host: String,
+    signing_path: &str,
+    query_pairs: &[(String, String)],
+    timestamp: i64,
+) -> Result<PreparedStorageRequest, AppError> {
+    let date = utc_datetime(timestamp)?.format("%Y%m%dT%H%M%SZ").to_string();
+    let query = canonical_query(query_pairs);
+    let mut signing = format!("GET {signing_path}");
+    if !query.is_empty() {
+        signing.push('?');
+        signing.push_str(&query);
+    }
+    signing.push_str("\nHost: ");
+    signing.push_str(&host);
+    signing.push_str("\nContent-Type: application/x-www-form-urlencoded");
+    signing.push_str("\nX-Qiniu-Date: ");
+    signing.push_str(&date);
+    signing.push_str("\n\n");
+    let sign = hmac_sha1_bytes(
+        request.credentials.access_key_secret.as_bytes(),
+        signing.as_bytes(),
+    )?;
+    let authorization = format!(
+        "Qiniu {}:{}",
+        request.credentials.access_key_id.trim(),
+        URL_SAFE.encode(sign)
+    );
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, ACCEPT, "application/json")?;
+    insert_header(&mut headers, HOST, &host)?;
+    insert_header(&mut headers, AUTHORIZATION, &authorization)?;
+    insert_header(&mut headers, CONTENT_TYPE, "application/x-www-form-urlencoded")?;
+    insert_named_header(&mut headers, "X-Qiniu-Date", &date)?;
+    Ok(PreparedStorageRequest {
+        method: Method::GET,
+        url,
+        headers,
+        signature: StorageSignaturePreview {
+            algorithm: "qiniu-mac",
+            timestamp: date,
+            signed_headers: "content-type;host;x-qiniu-date".into(),
+            canonical_request: signing,
+            string_to_sign: authorization.replace(
+                request.credentials.access_key_id.trim(),
+                &mask_key_id(&request.credentials.access_key_id),
+            ),
+            authorization: authorization.replace(
+                request.credentials.access_key_id.trim(),
+                &mask_key_id(&request.credentials.access_key_id),
+            ),
+            redacted: false,
+        },
+        presigned_url: None,
+    })
+}
+
+fn prepare_qiniu_upload(
+    request: &StorageRequest,
+    url: Url,
+    host: String,
+    timestamp: i64,
+    expires: u32,
+) -> Result<PreparedStorageRequest, AppError> {
+    let token = qiniu_upload_token(request, timestamp, expires)?;
+    let authorization = format!("UpToken {token}");
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, HOST, &host)?;
+    insert_header(&mut headers, AUTHORIZATION, &authorization)?;
+    insert_header(&mut headers, CONTENT_TYPE, &effective_content_type(request))?;
+    let masked = authorization.replace(
+        request.credentials.access_key_id.trim(),
+        &mask_key_id(&request.credentials.access_key_id),
+    );
+    Ok(PreparedStorageRequest {
+        method: Method::POST,
+        url,
+        headers,
+        signature: StorageSignaturePreview {
+            algorithm: "qiniu-uptoken",
+            timestamp: (timestamp + expires as i64).to_string(),
+            signed_headers: "authorization".into(),
+            canonical_request: format!(
+                "scope={}:{}",
+                request.bucket.trim(),
+                request.object_key.trim_start_matches('/')
+            ),
+            string_to_sign: masked.clone(),
+            authorization: masked,
+            redacted: false,
+        },
+        presigned_url: if request.operation.is_presign() {
+            Some(token)
+        } else {
+            None
+        },
+    })
+}
+
+fn prepare_qiniu_download(
+    request: &StorageRequest,
+    signing_path: &str,
+    host: String,
+    timestamp: i64,
+    expires: u32,
+) -> Result<PreparedStorageRequest, AppError> {
+    let deadline = timestamp
+        .checked_add(expires as i64)
+        .ok_or_else(|| AppError::new("invalid_expiration", "预签名有效期溢出"))?;
+    let unsigned = format!("https://{host}{signing_path}");
+    let with_deadline = format!("{unsigned}?e={deadline}");
+    let sign = hmac_sha1_bytes(
+        request.credentials.access_key_secret.as_bytes(),
+        with_deadline.as_bytes(),
+    )?;
+    let token = format!(
+        "{}:{}",
+        request.credentials.access_key_id.trim(),
+        URL_SAFE.encode(sign)
+    );
+    let signed = format!("{with_deadline}&token={token}");
+    let signed_url = Url::parse(&signed)
+        .map_err(|_| AppError::new("invalid_storage_endpoint", "无法生成七牛下载地址"))?;
+    let masked = signed.replace(
+        request.credentials.access_key_id.trim(),
+        &mask_key_id(&request.credentials.access_key_id),
+    );
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, HOST, &host)?;
+    insert_header(&mut headers, ACCEPT, "*/*")?;
+    Ok(PreparedStorageRequest {
+        method: Method::GET,
+        url: signed_url,
+        headers,
+        signature: StorageSignaturePreview {
+            algorithm: "qiniu-download-token",
+            timestamp: deadline.to_string(),
+            signed_headers: "host".into(),
+            canonical_request: with_deadline,
+            string_to_sign: masked.clone(),
+            authorization: masked,
+            redacted: false,
+        },
+        presigned_url: Some(signed),
+    })
+}
+
+fn qiniu_upload_token(
+    request: &StorageRequest,
+    timestamp: i64,
+    expires: u32,
+) -> Result<String, AppError> {
+    let deadline = timestamp
+        .checked_add(expires as i64)
+        .ok_or_else(|| AppError::new("invalid_expiration", "预签名有效期溢出"))?;
+    let policy = serde_json::json!({
+        "scope": format!(
+            "{}:{}",
+            request.bucket.trim(),
+            request.object_key.trim_start_matches('/')
+        ),
+        "deadline": deadline,
+    });
+    let encoded_policy = URL_SAFE.encode(policy.to_string().as_bytes());
+    let sign = hmac_sha1_bytes(
+        request.credentials.access_key_secret.as_bytes(),
+        encoded_policy.as_bytes(),
+    )?;
+    Ok(format!(
+        "{}:{}:{}",
+        request.credentials.access_key_id.trim(),
+        URL_SAFE.encode(sign),
+        encoded_policy
+    ))
+}
+
+fn qiniu_zone(region: &str) -> Result<&'static str, AppError> {
+    match region.trim().to_ascii_lowercase().as_str() {
+        "z0" | "cn-east-1" | "huadong" | "east" => Ok("z0"),
+        "z1" | "cn-north-1" | "huabei" | "north" => Ok("z1"),
+        "z2" | "cn-south-1" | "huanan" | "south" => Ok("z2"),
+        "na0" => Ok("na0"),
+        "as0" => Ok("as0"),
+        "cn-east-2" => Ok("cn-east-2"),
+        _ => Err(AppError::new(
+            "invalid_storage_parameter",
+            "七牛机房填 z0 / z1 / z2 / na0 / as0 / cn-east-2",
+        )),
+    }
+}
+
+fn qiniu_rsf_host(zone: &str) -> &'static str {
+    match zone {
+        "z1" => "rsf-z1.qiniuapi.com",
+        "z2" => "rsf-z2.qiniuapi.com",
+        "na0" => "rsf-na0.qiniuapi.com",
+        "as0" => "rsf-as0.qiniuapi.com",
+        "cn-east-2" => "rsf-cn-east-2.qiniuapi.com",
+        _ => "rsf.qiniuapi.com",
+    }
+}
+
+fn qiniu_upload_host(zone: &str) -> &'static str {
+    match zone {
+        "z1" => "upload-z1.qiniup.com",
+        "z2" => "upload-z2.qiniup.com",
+        "na0" => "upload-na0.qiniup.com",
+        "as0" => "upload-as0.qiniup.com",
+        "cn-east-2" => "upload-cn-east-2.qiniup.com",
+        _ => "upload.qiniup.com",
+    }
+}
+
+fn qiniu_io_host(zone: &str) -> &'static str {
+    match zone {
+        "z1" => "iovip-z1.qbox.me",
+        "z2" => "iovip-z2.qbox.me",
+        "na0" => "iovip-na0.qbox.me",
+        "as0" => "iovip-as0.qbox.me",
+        "cn-east-2" => "iovip-cn-east-2.qiniuio.com",
+        _ => "iovip.qbox.me",
+    }
+}
+
 fn validate_request(request: &StorageRequest) -> Result<(), AppError> {
     for (value, label) in [
         (&request.credentials.access_key_id, "AccessKey ID"),
@@ -918,7 +1226,12 @@ fn validate_request(request: &StorageRequest) -> Result<(), AppError> {
             ));
         }
     }
-    validate_dns_component(&request.region, "Region")?;
+    let region = if request.provider == StorageProvider::QiniuKodo {
+        request.region.trim().to_ascii_lowercase()
+    } else {
+        request.region.trim().to_string()
+    };
+    validate_dns_component(&region, "Region")?;
     if request.operation.needs_bucket() {
         if request.bucket.trim().is_empty() {
             return Err(AppError::new("missing_storage_field", "Bucket 不能为空"));
@@ -965,6 +1278,7 @@ fn effective_expiration(request: &StorageRequest) -> Result<u32, AppError> {
         StorageProvider::AlibabaOss => 604_800,
         StorageProvider::TencentCos => 604_800,
         StorageProvider::BaiduBos => 604_800,
+        StorageProvider::QiniuKodo => 604_800,
     };
     if !(1..=maximum).contains(&expires) {
         return Err(AppError::new(
@@ -976,6 +1290,9 @@ fn effective_expiration(request: &StorageRequest) -> Result<u32, AppError> {
 }
 
 fn endpoint(request: &StorageRequest) -> Result<(Url, String), AppError> {
+    if request.provider == StorageProvider::QiniuKodo {
+        return qiniu_endpoint(request);
+    }
     let region = request.region.trim().to_ascii_lowercase();
     let bucket = request.bucket.trim().to_ascii_lowercase();
     let encoded_key = encode_object_key(request.object_key.trim_start_matches('/'));
@@ -1021,10 +1338,29 @@ fn endpoint(request: &StorageRequest) -> Result<(Url, String), AppError> {
             };
             (host, actual_path.clone())
         }
+        StorageProvider::QiniuKodo => unreachable!("七牛 Endpoint 已单独生成"),
     };
     let url = Url::parse(&format!("https://{host}{actual_path}"))
         .map_err(|_| AppError::new("invalid_storage_endpoint", "无法生成对象存储官方地址"))?;
     Ok((url, signing_path))
+}
+
+fn qiniu_endpoint(request: &StorageRequest) -> Result<(Url, String), AppError> {
+    let zone = qiniu_zone(request.region.trim())?;
+    let encoded_key = encode_object_key(request.object_key.trim_start_matches('/'));
+    let (host, path): (String, String) = match request.operation {
+        StorageOperation::ListBuckets => ("uc.qiniuapi.com".into(), "/buckets".into()),
+        StorageOperation::ListObjects => (qiniu_rsf_host(zone).into(), "/list".into()),
+        StorageOperation::UploadObject | StorageOperation::PresignPut => {
+            (qiniu_upload_host(zone).into(), "/".into())
+        }
+        StorageOperation::DownloadObject | StorageOperation::PresignGet => {
+            (qiniu_io_host(zone).into(), format!("/{encoded_key}"))
+        }
+    };
+    let url = Url::parse(&format!("https://{host}{path}"))
+        .map_err(|_| AppError::new("invalid_storage_endpoint", "无法生成七牛官方地址"))?;
+    Ok((url, path))
 }
 
 fn list_query(request: &StorageRequest) -> Vec<(String, String)> {
@@ -1032,6 +1368,9 @@ fn list_query(request: &StorageRequest) -> Vec<(String, String)> {
         return Vec::new();
     }
     let mut pairs = Vec::new();
+    if request.provider == StorageProvider::QiniuKodo {
+        pairs.push(("bucket".into(), request.bucket.trim().into()));
+    }
     if !request.prefix.is_empty() {
         pairs.push(("prefix".into(), request.prefix.clone()));
     }
@@ -1042,6 +1381,7 @@ fn list_query(request: &StorageRequest) -> Vec<(String, String)> {
     pairs.push((
         match request.provider {
             StorageProvider::BaiduBos => "maxKeys",
+            StorageProvider::QiniuKodo => "limit",
             _ => "max-keys",
         }
         .into(),
@@ -1225,11 +1565,15 @@ fn hmac_sha256_hex(key: &[u8], value: &[u8]) -> Result<String, AppError> {
     Ok(hex_lower(&hmac_sha256_bytes(key, value)?))
 }
 
-fn hmac_sha1_hex(key: &[u8], value: &[u8]) -> Result<String, AppError> {
+fn hmac_sha1_bytes(key: &[u8], value: &[u8]) -> Result<Vec<u8>, AppError> {
     let mut mac = HmacSha1::new_from_slice(key)
         .map_err(|_| AppError::new("signature_error", "无法初始化 HMAC-SHA1"))?;
     mac.update(value);
-    Ok(hex_lower(&mac.finalize().into_bytes()))
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn hmac_sha1_hex(key: &[u8], value: &[u8]) -> Result<String, AppError> {
+    Ok(hex_lower(&hmac_sha1_bytes(key, value)?))
 }
 
 fn hex_lower(value: &[u8]) -> String {
@@ -1310,6 +1654,7 @@ mod tests {
                 StorageProvider::TencentCos => "ap-beijing",
                 StorageProvider::BaiduBos => "bj",
                 StorageProvider::AlibabaOss => "cn-hangzhou",
+                StorageProvider::QiniuKodo => "z0",
             }
             .into(),
             bucket: match provider {
@@ -1413,6 +1758,7 @@ mod tests {
             StorageProvider::AlibabaOss,
             StorageProvider::TencentCos,
             StorageProvider::BaiduBos,
+            StorageProvider::QiniuKodo,
         ] {
             let request = request(provider, StorageOperation::DownloadObject);
             let (url, _) = endpoint(&request).expect("endpoint should build");
@@ -1421,8 +1767,45 @@ mod tests {
                 host.ends_with(".aliyuncs.com")
                     || host.ends_with(".myqcloud.com")
                     || host.ends_with(".bcebos.com")
+                    || host.ends_with(".qbox.me")
+                    || host.ends_with(".qiniuio.com")
             );
         }
+    }
+
+    #[test]
+    fn qiniu_upload_token_has_three_segments_and_hides_secret() {
+        let request = request(StorageProvider::QiniuKodo, StorageOperation::PresignPut);
+        let prepared = prepare(&request, 1_745_729_029).expect("qiniu upload token should build");
+        let token = prepared.presigned_url.expect("upload token should be returned");
+        assert_eq!(token.split(':').count(), 3);
+        assert!(token.starts_with("AKIDEXAMPLE1234:"));
+        assert!(!prepared.signature.authorization.contains("SECRETEXAMPLE"));
+        assert_eq!(prepared.method, Method::POST);
+        assert_eq!(prepared.url.host_str(), Some("upload.qiniup.com"));
+    }
+
+    #[test]
+    fn qiniu_download_url_signs_deadline_query() {
+        let request = request(StorageProvider::QiniuKodo, StorageOperation::PresignGet);
+        let prepared = prepare(&request, 1_745_729_029).expect("qiniu download url should build");
+        let signed = prepared.presigned_url.expect("download url should be returned");
+        assert!(signed.starts_with("https://iovip.qbox.me/"));
+        assert!(signed.contains("e=1745732629"));
+        assert!(signed.contains("token=AKIDEXAMPLE1234:"));
+        assert!(!prepared.signature.authorization.contains("SECRETEXAMPLE"));
+    }
+
+    #[test]
+    fn qiniu_list_uses_management_host_and_limit() {
+        let request = request(StorageProvider::QiniuKodo, StorageOperation::ListObjects);
+        let prepared = prepare(&request, 1_745_729_029).expect("qiniu list should build");
+        assert_eq!(prepared.url.host_str(), Some("rsf.qiniuapi.com"));
+        assert_eq!(prepared.url.path(), "/list");
+        let query = prepared.url.query().unwrap_or("");
+        assert!(query.contains("bucket=examplebucket"));
+        assert!(query.contains("limit=100"));
+        assert!(prepared.signature.authorization.starts_with("Qiniu "));
     }
 
     #[test]
